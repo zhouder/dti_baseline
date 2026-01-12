@@ -1,30 +1,15 @@
 # -*- coding: utf-8 -*-
 """run.py
 
-DrugBAN baseline runner (your all.csv) + strict warm/cold splits + **方案B：离线缓存特征**。
+DrugBAN runner for CSV datasets under /root/lanyun-fs:
+  - davis.csv / drugbank.csv / kiba.csv
+Columns (case-insensitive, order-independent):
+  - uid, cid, smile, seq, label
 
-Why 方案B
----------
-DrugBAN 的 DTIDataset 在 __getitem__ 里会调用 RDKit + dgllife + DGL 去构图/编码蛋白。
-在一些环境里（尤其 DataLoader workers>0）很容易因为 RDKit/DGL 的动态库/多进程问题崩溃或卡住。
+This script keeps DrugBAN model and modalities unchanged.
+It implements strict warm/cold splits and offline feature caching (Plan B).
 
-方案B做法：
-1) 单进程（workers=0）把每条样本的 (drug_graph, protein_tensor, label) 预先算好并缓存到磁盘
-2) 训练时 DataLoader 只做「读缓存 + batch」，workers 可以安全开大
-
-缓存位置：默认放在 --out 目录下的 cache/ 子目录（满足你“cache存到drugban-runs下”）。
-
-CSV 列要求（大小写不敏感）：
-  - smiles
-  - protein (或 sequence/target/target sequence)
-  - label (或 y)
-
-Run examples
-------------
-python -u run.py --dataset DAVIS --split-mode warm --build-cache --cache-workers 0 --workers 8
-
-python -u run.py --dataset BioSNAP --split-mode warm --build-cache --truncate-large-mols \
-  --max-drug-nodes 290 --workers 8
+Cache is stored under: {out_root}/cache/
 """
 
 from __future__ import annotations
@@ -32,11 +17,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import time
 import warnings
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -49,7 +33,6 @@ try:
 except Exception:
     tqdm = None
 
-# sklearn metrics
 try:
     from sklearn.metrics import (
         roc_auc_score,
@@ -60,31 +43,25 @@ try:
         precision_score,
         matthews_corrcoef,
     )
-
     _HAS_SK = True
 except Exception:
     _HAS_SK = False
 
-# RDKit for SMILES validation
 try:
     from rdkit import Chem
-
     _HAS_RDKIT = True
 except Exception:
     _HAS_RDKIT = False
 
-# DrugBAN modules (local)
+# DrugBAN local modules
 from configs import get_cfg_defaults
 from dataloader import DTIDataset
 import dataloader as _drugban_dataloader
 from models import DrugBAN
 
 
-# ------------------------- multiprocessing safety -------------------------
-
 def _set_mp_safe():
     import torch.multiprocessing as mp
-
     try:
         mp.set_sharing_strategy("file_system")
     except Exception:
@@ -95,32 +72,99 @@ def _set_mp_safe():
         pass
 
 
-# ------------------------- dataset patch (truncate big mols) -------------------------
+def set_seed(seed: int):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    low2col = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in low2col:
+            return low2col[c.lower()]
+    return None
+
+
+def load_dataset_csv(csv_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+
+    c_uid = _find_col(df, ["uid"])
+    c_cid = _find_col(df, ["cid"])
+    c_smiles = _find_col(df, ["smile", "smiles"])
+    c_seq = _find_col(df, ["seq", "sequence", "protein"])
+    c_y = _find_col(df, ["label", "y"])
+
+    missing = []
+    if c_smiles is None:
+        missing.append("smile/smiles")
+    if c_seq is None:
+        missing.append("seq/sequence/protein")
+    if c_y is None:
+        missing.append("label/y")
+    if missing:
+        raise ValueError(f"CSV missing required columns: {missing}. Current columns={list(df.columns)}")
+
+    keep_cols = [c_smiles, c_seq, c_y]
+    rename = {c_smiles: "SMILES", c_seq: "Protein", c_y: "Y"}
+
+    if c_uid is not None:
+        keep_cols.append(c_uid)
+        rename[c_uid] = "UID"
+    if c_cid is not None:
+        keep_cols.append(c_cid)
+        rename[c_cid] = "CID"
+
+    df = df[keep_cols].rename(columns=rename)
+    df = df.dropna().reset_index(drop=True)
+
+    df["SMILES"] = df["SMILES"].astype(str)
+    df["Protein"] = df["Protein"].astype(str)
+    df["Y"] = pd.to_numeric(df["Y"], errors="coerce")
+    df = df.dropna(subset=["Y"]).reset_index(drop=True)
+
+    if "UID" in df.columns:
+        df["UID"] = df["UID"].astype(str)
+    if "CID" in df.columns:
+        df["CID"] = df["CID"].astype(str)
+
+    if _HAS_RDKIT:
+        ok = []
+        for s in df["SMILES"].values:
+            try:
+                ok.append(Chem.MolFromSmiles(s) is not None)
+            except Exception:
+                ok.append(False)
+        ok = np.asarray(ok, dtype=bool)
+        before = len(df)
+        df = df.loc[ok].reset_index(drop=True)
+        if before != len(df):
+            print(f"[CLEAN] invalid SMILES filtered: {before} -> {len(df)}")
+    else:
+        print("[WARN] RDKit not available; skip SMILES validity filtering.")
+
+    return df
+
 
 def _sanitize_graph_inplace(g):
-    """Keep schema stable across graphs: only keep ndata['h']; drop all edata."""
-    # node data
     for k in list(g.ndata.keys()):
         if k != "h":
             g.ndata.pop(k)
-    # edge data (model doesn't use it)
     for k in list(g.edata.keys()):
         g.edata.pop(k)
     return g
 
 
 def _maybe_patch_dataset_truncation(truncate: bool, max_nodes: int):
-    """Patch DTIDataset.__getitem__ to truncate oversized molecules BEFORE padding.
-
-    Why: upstream DTIDataset assumes num_atoms <= max_drug_nodes; otherwise num_virtual becomes negative.
-    Also, dgl.node_subgraph may attach _ID fields; we remove them to avoid dgl.batch schema mismatch.
-    """
     if not truncate:
         return
 
     try:
-        import dgl
-        import torch
+        import dgl  # noqa
+        import torch  # noqa
     except Exception:
         return
 
@@ -128,8 +172,10 @@ def _maybe_patch_dataset_truncation(truncate: bool, max_nodes: int):
         return
 
     def _getitem(self, index):
-        index = self.list_IDs[index]
+        import dgl
+        import torch
 
+        index = self.list_IDs[index]
         smi = self.df.iloc[index]["SMILES"]
         g = self.fc(smiles=smi, node_featurizer=self.atom_featurizer, edge_featurizer=self.bond_featurizer)
 
@@ -138,7 +184,6 @@ def _maybe_patch_dataset_truncation(truncate: bool, max_nodes: int):
         if n_nodes > max_n:
             keep = list(range(max_n))
             g = dgl.node_subgraph(g, keep)
-            # node_subgraph often adds "_ID" / "_TYPE" etc
             for k in list(g.ndata.keys()):
                 if str(k).startswith("_"):
                     g.ndata.pop(k)
@@ -166,7 +211,11 @@ def _maybe_patch_dataset_truncation(truncate: bool, max_nodes: int):
             )
             g.add_nodes(num_virtual, {"h": v_feat})
 
-        g = g.add_self_loop()
+        try:
+            g = g.add_self_loop()
+        except Exception:
+            g = dgl.add_self_loop(g)
+
         _sanitize_graph_inplace(g)
 
         seq = self.df.iloc[index]["Protein"]
@@ -177,8 +226,6 @@ def _maybe_patch_dataset_truncation(truncate: bool, max_nodes: int):
     DTIDataset.__getitem__ = _getitem
     DTIDataset._patched_truncate_large = True
 
-
-# ------------------------- collate -------------------------
 
 def graph_collate_func_safe(batch):
     import dgl
@@ -199,64 +246,6 @@ def graph_collate_func_safe(batch):
     return bg, p, y
 
 
-# ------------------------- utils -------------------------
-
-def set_seed(seed: int):
-    import random
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _find_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
-    low2col = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in low2col:
-            return low2col[c.lower()]
-    return None
-
-
-def load_all_csv(all_csv: Path) -> pd.DataFrame:
-    """Load and normalize all.csv to columns: SMILES / Protein / Y."""
-    df = pd.read_csv(all_csv)
-
-    c_smiles = _find_col(df, ["smiles", "drug", "compound", "ligand"])
-    c_prot = _find_col(df, ["protein", "sequence", "target", "target sequence"])
-    c_y = _find_col(df, ["label", "y"])
-    if c_smiles is None or c_prot is None or c_y is None:
-        raise ValueError(
-            f"all.csv 缺列：需要 smiles/protein/label（大小写不敏感）。当前列={list(df.columns)}"
-        )
-
-    df = df[[c_smiles, c_prot, c_y]].rename(columns={c_smiles: "SMILES", c_prot: "Protein", c_y: "Y"})
-    df = df.dropna().reset_index(drop=True)
-    df["SMILES"] = df["SMILES"].astype(str)
-    df["Protein"] = df["Protein"].astype(str)
-    df["Y"] = pd.to_numeric(df["Y"], errors="coerce")
-    df = df.dropna(subset=["Y"]).reset_index(drop=True)
-
-    # Filter invalid smiles (important for BindingDB)
-    if _HAS_RDKIT:
-        ok = []
-        for s in df["SMILES"].values:
-            try:
-                ok.append(Chem.MolFromSmiles(s) is not None)
-            except Exception:
-                ok.append(False)
-        ok = np.asarray(ok, dtype=bool)
-        before = len(df)
-        df = df.loc[ok].reset_index(drop=True)
-        if before != len(df):
-            print(f"[CLEAN] invalid SMILES filtered: {before} -> {len(df)}")
-    else:
-        print("[WARN] RDKit not available; skip SMILES validity filtering.")
-
-    return df
-
-
 def compute_metrics(prob: np.ndarray, lab: np.ndarray, thr: float = 0.5) -> Dict[str, float]:
     prob = np.asarray(prob, dtype=np.float32).reshape(-1)
     lab = np.asarray(lab, dtype=np.float32).reshape(-1)
@@ -267,8 +256,8 @@ def compute_metrics(prob: np.ndarray, lab: np.ndarray, thr: float = 0.5) -> Dict
     out["acc"] = float((y_pred == y_true).mean())
 
     if (not _HAS_SK) or (len(np.unique(y_true)) < 2):
-        out.update({"auc": float("nan"), "auprc": float("nan"), "f1": float("nan"), "recall": float("nan"),
-                    "precision": float("nan"), "mcc": float("nan")})
+        out.update({"auc": float("nan"), "auprc": float("nan"), "f1": float("nan"),
+                    "recall": float("nan"), "precision": float("nan"), "mcc": float("nan")})
         return out
 
     try:
@@ -316,8 +305,6 @@ def find_best_threshold(prob: np.ndarray, lab: np.ndarray) -> float:
     return best_t
 
 
-# ------------------------- split utilities -------------------------
-
 def _chunk_unique(arr: np.ndarray, n_splits: int, seed: int) -> List[np.ndarray]:
     uniq = np.unique(arr)
     rng = np.random.default_rng(seed)
@@ -333,7 +320,6 @@ def make_outer_splits(
     prot_key: np.ndarray,
     labels: np.ndarray,
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """Return list of (train_pool_idx, test_idx)."""
     from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
 
     N = len(labels)
@@ -361,13 +347,10 @@ def make_outer_splits(
             te = np.where(test_mask)[0]
             tr_pool = np.where(pool_mask)[0]
             if len(te) == 0 or len(tr_pool) == 0:
-                raise RuntimeError(
-                    f"cold-both fold{k+1}: test or train_pool is empty. Try fewer folds or another split mode."
-                )
+                raise RuntimeError(f"cold-both fold{k+1}: test or train_pool is empty.")
             out.append((tr_pool, te))
         return out
 
-    # warm/hot
     if len(np.unique(labels)) == 2:
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=seed)
         return [(tr, te) for tr, te in skf.split(all_idx, labels)]
@@ -430,11 +413,14 @@ def sample_val_indices(
 
     if mode == "cold-both":
         rng = np.random.default_rng(seed)
-        d_pool = np.unique(drug_key[pool_idx]); rng.shuffle(d_pool)
-        p_pool = np.unique(prot_key[pool_idx]); rng.shuffle(p_pool)
+        d_pool = np.unique(drug_key[pool_idx])
+        p_pool = np.unique(prot_key[pool_idx])
+        rng.shuffle(d_pool)
+        rng.shuffle(p_pool)
         nd = max(1, int(round(val_frac_in_pool * len(d_pool))))
         np_ = max(1, int(round(val_frac_in_pool * len(p_pool))))
-        val_d = set(d_pool[:nd]); val_p = set(p_pool[:np_])
+        val_d = set(d_pool[:nd])
+        val_p = set(p_pool[:np_])
         d_sub = drug_key[pool_idx]
         p_sub = prot_key[pool_idx]
         va_mask = np.array([(d in val_d) and (p in val_p) for d, p in zip(d_sub, p_sub)], dtype=bool)
@@ -459,16 +445,8 @@ def summarize_split(name: str, idx: np.ndarray, drug_key: np.ndarray, prot_key: 
     print(msg)
 
 
-# ------------------------- 方案B：cache -------------------------
-
-def _cache_tag(ds: str, max_nodes: int, truncate: bool) -> str:
-    # protein encoding length is fixed at 1200 in DrugBAN utils
-    return f"{ds}_max{int(max_nodes)}_prot1200_trunc{int(bool(truncate))}"
-
-
-def _default_cache_root(out_root: Path) -> Path:
-    # cache MUST be under drugban-runs (your requirement)
-    return out_root / "cache"
+def _cache_tag(ds_name: str, max_nodes: int, truncate: bool) -> str:
+    return f"{ds_name}_max{int(max_nodes)}_prot1200_trunc{int(bool(truncate))}"
 
 
 def _write_json(path: Path, obj: dict):
@@ -478,8 +456,6 @@ def _write_json(path: Path, obj: dict):
 
 
 class CachedDTIView(Dataset):
-    """Dataset view that reads cached features by global row index."""
-
     def __init__(self, indices: np.ndarray, cache_dir: Path):
         self.indices = np.asarray(indices, dtype=int)
         self.cache_dir = Path(cache_dir)
@@ -489,7 +465,6 @@ class CachedDTIView(Dataset):
 
     def __getitem__(self, i: int):
         import dgl
-
         idx = int(self.indices[i])
         f = self.cache_dir / f"{idx}.bin"
         graphs, label_dict = dgl.load_graphs(str(f))
@@ -505,23 +480,19 @@ def build_cache_if_needed(
     cache_dir: Path,
     max_drug_nodes: int,
     truncate_large_mols: bool,
-    cache_workers: int = 0,
     refresh: bool = False,
 ):
-    """Build cache files {idx}.bin for idx in [0, N)."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     meta_path = cache_dir / "meta.json"
 
     if refresh and cache_dir.exists():
-        # only delete bin files; keep folder
         for p in cache_dir.glob("*.bin"):
             try:
                 p.unlink()
             except Exception:
                 pass
 
-    # Detect if cache seems complete
     N = len(df_all)
     existing = sum(1 for _ in cache_dir.glob("*.bin"))
     if existing >= N and meta_path.exists() and (not refresh):
@@ -530,17 +501,11 @@ def build_cache_if_needed(
 
     print(f"[CACHE] build -> {cache_dir} (existing={existing}/{N})")
 
-    # Always build cache in a safe single-process way by default.
-    # We ignore cache_workers for now (RDKit/DGL in multi-process is exactly what we want to avoid).
-    # Users can still set cache_workers>0 if their env is stable.
-    build_workers = int(cache_workers)
-
-    # Base dataset over the FULL df with list_IDs = [0..N-1]
     base = DTIDataset(np.arange(N), df_all, max_drug_nodes=int(max_drug_nodes))
 
     import dgl
 
-    def _build_one(idx: int) -> Tuple[int, str | None]:
+    def _build_one(idx: int) -> Tuple[int, Optional[str]]:
         out_f = cache_dir / f"{idx}.bin"
         if out_f.exists():
             return idx, None
@@ -555,8 +520,6 @@ def build_cache_if_needed(
             return idx, repr(e)
 
     bad: List[Tuple[int, str]] = []
-
-    # Build (single process by default)
     it = range(N)
     if tqdm is not None:
         it = tqdm(it, total=N, ncols=120, desc="[CACHE]", leave=True)
@@ -566,7 +529,6 @@ def build_cache_if_needed(
         if err is not None:
             bad.append((_i, err))
 
-    # meta
     meta = {
         "N": int(N),
         "max_drug_nodes": int(max_drug_nodes),
@@ -576,7 +538,6 @@ def build_cache_if_needed(
     }
     try:
         import dgl  # noqa
-
         meta["dgl"] = getattr(dgl, "__version__", "")
     except Exception:
         meta["dgl"] = ""
@@ -603,8 +564,6 @@ def filter_indices_by_cache(indices: np.ndarray, cache_dir: Path) -> np.ndarray:
     return np.asarray(ok, dtype=int)
 
 
-# ------------------------- train/eval -------------------------
-
 @torch.no_grad()
 def eval_epoch(model: DrugBAN, loader: DataLoader, device: torch.device, crit: nn.Module) -> Tuple[float, np.ndarray, np.ndarray]:
     model.train(False)
@@ -615,6 +574,7 @@ def eval_epoch(model: DrugBAN, loader: DataLoader, device: torch.device, crit: n
     it = loader
     if tqdm is not None:
         it = tqdm(loader, total=len(loader), ncols=120, leave=False, desc="eval")
+
     for bg_d, v_p, y in it:
         bg_d = bg_d.to(device)
         v_p = v_p.to(device)
@@ -636,9 +596,11 @@ def train_epoch(model: DrugBAN, loader: DataLoader, device: torch.device, optimi
     model.train(True)
     loss_sum = 0.0
     n = 0
+
     it = loader
     if tqdm is not None:
         it = tqdm(loader, total=len(loader), ncols=120, leave=False, desc="train")
+
     for bg_d, v_p, y in it:
         bg_d = bg_d.to(device)
         v_p = v_p.to(device)
@@ -652,67 +614,42 @@ def train_epoch(model: DrugBAN, loader: DataLoader, device: torch.device, optimi
         bs = int(y.shape[0])
         loss_sum += float(loss.item()) * bs
         n += bs
+
     return loss_sum / max(1, n)
 
 
-# ------------------------- args/main -------------------------
-
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", required=True, help="DAVIS / BindingDB / BioSNAP (folder name under data-root)")
-    ap.add_argument("--data-root", type=str, default="/root/lanyun-tmp")
+    ap.add_argument("--dataset", required=True, help="davis / drugbank / kiba (or provide --csv)")
+    ap.add_argument("--data-root", type=str, default="/root/lanyun-fs")
+    ap.add_argument("--csv", type=str, default="", help="Optional explicit csv path (overrides --dataset)")
     ap.add_argument("--out", type=str, default="/root/lanyun-tmp/drugban-runs")
-    ap.add_argument("--cfg", type=str, default="configs/DrugBAN.yaml", help="DrugBAN yaml config")
+    ap.add_argument("--cfg", type=str, default="configs/DrugBAN.yaml")
 
-    ap.add_argument(
-        "--split-mode",
-        choices=["warm", "hot", "cold-protein", "cold-drug", "cold-pair", "cold-both"],
-        default="warm",
-    )
+    ap.add_argument("--split-mode",
+                    choices=["warm", "hot", "cold-protein", "cold-drug", "cold-pair", "cold-both"],
+                    default="warm")
     ap.add_argument("--cv-folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
+
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--workers", type=int, default=8, help="训练 DataLoader workers（方案B缓存后建议 >=4）")
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=5e-5)
 
-    ap.add_argument(
-        "--max-drug-nodes",
-        type=int,
-        default=290,
-        help="drug 图固定节点上限（DrugBAN padding 到该长度）",
-    )
-    ap.add_argument(
-        "--truncate-large-mols",
-        action="store_true",
-        help="若原子数超过 max_drug_nodes，则截断到前 max_drug_nodes 个节点（避免崩溃，且更省显存）",
-    )
+    ap.add_argument("--max-drug-nodes", type=int, default=290)
+    ap.add_argument("--truncate-large-mols", action="store_true")
 
-    ap.add_argument(
-        "--build-cache",
-        action="store_true",
-        help="强制构建/补全缓存（默认：若缓存不完整会自动构建）",
-    )
-    ap.add_argument(
-        "--refresh-cache",
-        action="store_true",
-        help="删除并重建缓存（当你改了 max_drug_nodes / truncate 等参数时用）",
-    )
-    ap.add_argument(
-        "--cache-workers",
-        type=int,
-        default=0,
-        help="构建缓存时的 workers（默认0最稳；>0 只有在你环境很稳时再尝试）",
-    )
-
+    ap.add_argument("--refresh-cache", action="store_true")
     ap.add_argument("--label-thr", type=float, default=None)
     ap.add_argument("--label-thr-op", choices=["ge", "le"], default="ge")
+
     ap.add_argument("--pos-weight", choices=["auto", "none"], default="auto")
-    ap.add_argument("--suppress-warnings", action="store_true")
-    ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--es-min-delta", type=float, default=1e-4)
     ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--suppress-warnings", action="store_true")
     return ap.parse_args()
 
 
@@ -722,24 +659,25 @@ def main():
     if args.suppress_warnings:
         warnings.filterwarnings("ignore", category=FutureWarning)
         warnings.filterwarnings("ignore", message=".*TensorDispatcher: dlopen failed.*")
+        warnings.filterwarnings("ignore", message=".*You are using `torch.load`.*")
 
     set_seed(args.seed)
     _set_mp_safe()
-
     _maybe_patch_dataset_truncation(bool(args.truncate_large_mols), int(args.max_drug_nodes))
 
-    ds_lower = args.dataset.strip().lower()
-    ds = {"bindingdb": "BindingDB", "davis": "DAVIS", "biosnap": "BioSNAP"}.get(ds_lower, args.dataset)
+    if args.csv:
+        csv_path = Path(args.csv)
+        ds_name = csv_path.stem
+    else:
+        ds_name = args.dataset.strip().lower()
+        csv_path = Path(args.data_root) / f"{ds_name}.csv"
 
-    data_root = Path(args.data_root)
-    all_csv = data_root / ds / "all.csv"
-    if not all_csv.exists():
-        raise FileNotFoundError(f"未找到 {all_csv}")
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    df_all = load_all_csv(all_csv)
-    print(f"[ALL] loaded {len(df_all)} rows from {all_csv}")
+    df_all = load_dataset_csv(csv_path)
+    print(f"[ALL] loaded {len(df_all)} rows from {csv_path}")
 
-    # optional binarize
     if args.label_thr is not None:
         thr = float(args.label_thr)
         if args.label_thr_op == "ge":
@@ -748,14 +686,28 @@ def main():
             df_all["Y"] = (df_all["Y"].astype(float) <= thr).astype(np.float32)
         print(f"[LABEL] binarized by {args.label_thr_op} {thr}")
 
-    drug_key = df_all["SMILES"].values.astype(object)
-    prot_key = df_all["Protein"].values.astype(object)
     labels = df_all["Y"].values.astype(np.float32)
+
+    # Prefer CID/UID as entity keys for cold splits when available
+    if "CID" in df_all.columns:
+        drug_key = df_all["CID"].values.astype(object)
+        drug_key_name = "CID"
+    else:
+        drug_key = df_all["SMILES"].values.astype(object)
+        drug_key_name = "SMILES"
+
+    if "UID" in df_all.columns:
+        prot_key = df_all["UID"].values.astype(object)
+        prot_key_name = "UID"
+    else:
+        prot_key = df_all["Protein"].values.astype(object)
+        prot_key_name = "Protein"
+
+    print(f"[KEY] drug_key={drug_key_name} | prot_key={prot_key_name}")
 
     device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
     print(f"[Device] {device}")
 
-    # config
     cfg = get_cfg_defaults()
     cfg.merge_from_file(args.cfg)
     cfg.SOLVER.MAX_EPOCH = int(args.epochs)
@@ -765,32 +717,27 @@ def main():
     cfg.SOLVER.SEED = int(args.seed)
     cfg.DA.USE = False
 
-    # cache root (under drugban-runs)
     out_root = Path(args.out)
-    cache_root = _default_cache_root(out_root)
-    cache_dir = cache_root / _cache_tag(ds, int(args.max_drug_nodes), bool(args.truncate_large_mols))
+    run_dir = out_root / f"{ds_name}_{args.split_mode}"
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    # build cache (auto)
-    existing = sum(1 for _ in cache_dir.glob("*.bin"))
-    if args.refresh_cache or args.build_cache or existing < len(df_all):
-        build_cache_if_needed(
-            df_all=df_all,
-            cache_dir=cache_dir,
-            max_drug_nodes=int(args.max_drug_nodes),
-            truncate_large_mols=bool(args.truncate_large_mols),
-            cache_workers=int(args.cache_workers),
-            refresh=bool(args.refresh_cache),
-        )
+    cache_root = out_root / "cache"
+    cache_dir = cache_root / _cache_tag(ds_name, int(args.max_drug_nodes), bool(args.truncate_large_mols))
 
-    # outer splits
+    build_cache_if_needed(
+        df_all=df_all,
+        cache_dir=cache_dir,
+        max_drug_nodes=int(args.max_drug_nodes),
+        truncate_large_mols=bool(args.truncate_large_mols),
+        refresh=bool(args.refresh_cache),
+    )
+
     split_mode = "warm" if args.split_mode == "hot" else args.split_mode
     outer_splits = make_outer_splits(split_mode, args.cv_folds, args.seed, drug_key, prot_key, labels)
     K = len(outer_splits)
     val_frac_in_pool = 0.10 / (1.0 - 1.0 / K)
-    print(f"[SPLIT] target train/val/test = 0.70/0.10/0.20 | K={K} | val_frac_in_pool={val_frac_in_pool:.4f}")
 
-    run_dir = out_root / f"{ds}_{args.split_mode}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[SPLIT] target train/val/test = 0.70/0.10/0.20 | K={K} | val_frac_in_pool={val_frac_in_pool:.4f}")
     print(f"[OUT] {run_dir}")
     print(f"[CACHE] {cache_dir}")
 
@@ -822,7 +769,6 @@ def main():
             labels,
         )
 
-        # Ensure indices exist in cache (in case some items failed during cache build)
         tr_idx = filter_indices_by_cache(tr_idx, cache_dir)
         va_idx = filter_indices_by_cache(va_idx, cache_dir)
         te_idx = filter_indices_by_cache(test_idx, cache_dir)
@@ -836,7 +782,7 @@ def main():
         val_set = CachedDTIView(va_idx, cache_dir)
         test_set = CachedDTIView(te_idx, cache_dir)
 
-        dl_params_train = dict(
+        dl_train = dict(
             batch_size=int(cfg.SOLVER.BATCH_SIZE),
             num_workers=int(cfg.SOLVER.NUM_WORKERS),
             collate_fn=graph_collate_func_safe,
@@ -844,7 +790,7 @@ def main():
             pin_memory=(device.type == "cuda"),
             persistent_workers=(int(cfg.SOLVER.NUM_WORKERS) > 0),
         )
-        dl_params_eval = dict(
+        dl_eval = dict(
             batch_size=int(cfg.SOLVER.BATCH_SIZE),
             num_workers=int(cfg.SOLVER.NUM_WORKERS),
             collate_fn=graph_collate_func_safe,
@@ -853,19 +799,17 @@ def main():
             persistent_workers=(int(cfg.SOLVER.NUM_WORKERS) > 0),
         )
         if int(cfg.SOLVER.NUM_WORKERS) > 0:
-            dl_params_train["multiprocessing_context"] = "spawn"
-            dl_params_eval["multiprocessing_context"] = "spawn"
+            dl_train["multiprocessing_context"] = "spawn"
+            dl_eval["multiprocessing_context"] = "spawn"
 
-        train_loader = DataLoader(train_set, shuffle=True, **dl_params_train)
-        val_loader = DataLoader(val_set, shuffle=False, **dl_params_eval)
-        test_loader = DataLoader(test_set, shuffle=False, **dl_params_eval)
+        train_loader = DataLoader(train_set, shuffle=True, **dl_train)
+        val_loader = DataLoader(val_set, shuffle=False, **dl_eval)
+        test_loader = DataLoader(test_set, shuffle=False, **dl_eval)
 
         model = DrugBAN(**cfg).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.SOLVER.LR))
 
-        # Loss (imbalance)
         if args.pos_weight == "auto":
-            # read labels from cached indices
             y_tr = labels[tr_idx]
             pos = float((y_tr >= 0.5).sum())
             neg = float(len(y_tr) - pos)
@@ -879,28 +823,16 @@ def main():
         else:
             crit = nn.BCEWithLogitsLoss()
 
-        # log header
         if not log_csv.exists():
             with open(log_csv, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(
-                    [
-                        "epoch",
-                        "lr",
-                        "train_loss",
-                        "val_loss",
-                        "val_auc",
-                        "val_auprc",
-                        "val_thr",
-                        "val_f1",
-                        "val_acc",
-                        "val_recall",
-                        "val_precision",
-                        "val_mcc",
-                        "is_best_val_auprc",
-                        "time_sec",
-                    ]
-                )
+                w.writerow([
+                    "epoch", "lr",
+                    "train_loss", "val_loss",
+                    "val_auc", "val_auprc", "val_thr",
+                    "val_f1", "val_acc", "val_recall", "val_precision", "val_mcc",
+                    "is_best_val_auprc", "time_sec",
+                ])
 
         best_val_auprc = -1.0
         bad_cnt = 0
@@ -917,6 +849,7 @@ def main():
 
         for ep in range(start_epoch, int(cfg.SOLVER.MAX_EPOCH) + 1):
             t0 = time.time()
+
             tr_loss = train_epoch(model, train_loader, device, optimizer, crit)
             va_loss, va_prob, va_lab = eval_epoch(model, val_loader, device, crit)
             thr_now = find_best_threshold(va_prob, va_lab)
@@ -929,7 +862,7 @@ def main():
                 best_val_auprc = cur
                 bad_cnt = 0
                 torch.save({"model": model.state_dict()}, best_pt)
-                print(f">>> [BEST] val AUPRC improved: {prev:.6f} -> {best_val_auprc:.6f} | saved best.pt")
+                print(f">>> [BEST] val AUPRC: {prev:.6f} -> {best_val_auprc:.6f} | saved best.pt")
             else:
                 bad_cnt += 1
 
@@ -953,30 +886,19 @@ def main():
             )
 
             with open(log_csv, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(
-                    [
-                        ep,
-                        lr_now,
-                        float(tr_loss),
-                        float(va_loss),
-                        float(va_met["auc"]),
-                        float(va_met["auprc"]),
-                        float(thr_now),
-                        float(va_met["f1"]),
-                        float(va_met["acc"]),
-                        float(va_met["recall"]),
-                        float(va_met["precision"]),
-                        float(va_met["mcc"]),
-                        int(improved),
-                        float(dt),
-                    ]
-                )
+                csv.writer(f).writerow([
+                    ep, lr_now,
+                    float(tr_loss), float(va_loss),
+                    float(va_met["auc"]), float(va_met["auprc"]), float(thr_now),
+                    float(va_met["f1"]), float(va_met["acc"]), float(va_met["recall"]),
+                    float(va_met["precision"]), float(va_met["mcc"]),
+                    int(improved), float(dt),
+                ])
 
             if args.patience > 0 and bad_cnt >= args.patience:
                 print(f"[EarlyStop] no improve for {bad_cnt} epochs. stop.")
                 break
 
-        # test
         used = "best.pt" if best_pt.exists() else "last.pt"
         ckpt = best_pt if best_pt.exists() else last_pt
         ck = torch.load(ckpt, map_location="cpu")
@@ -1006,7 +928,6 @@ def main():
             for k in keys:
                 w.writerow([k, float(te_met.get(k, float("nan")))])
 
-    # summary
     mean = {k: float(np.nanmean([m.get(k, float("nan")) for m in fold_metrics])) for k in keys}
     std = {k: float(np.nanstd([m.get(k, float("nan")) for m in fold_metrics])) for k in keys}
     summary_csv = run_dir / "summary.csv"

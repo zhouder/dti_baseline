@@ -645,7 +645,7 @@ def parse_args():
     ap.add_argument("--label-thr-op", choices=["ge", "le"], default="ge")
 
     ap.add_argument("--pos-weight", choices=["auto", "none"], default="auto")
-    ap.add_argument("--patience", type=int, default=20)
+    ap.add_argument("--patience", type=int, default=10)
     ap.add_argument("--es-min-delta", type=float, default=1e-4)
     ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     ap.add_argument("--resume", action="store_true")

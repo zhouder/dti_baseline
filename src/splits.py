@@ -1,387 +1,164 @@
-# src/splits.py
-# -*- coding: utf-8 -*-
 """
-Splitting utilities for DTI.
+splits.py
 
-Used by train.py:
-1) make_outer_splits(split_mode, n_splits, seed, drug_key, prot_key, y)
-2) sample_val_indices(split_mode, train_idx, val_frac, seed, drug_key, prot_key, y)
+DTI 5-fold splits supporting:
+- warm
+- cold-drug
+- cold-protein
+- cold-both
 
-split_mode:
-  - warm / hot      : random KFold / StratifiedKFold (binary)
-  - cold-drug       : train/test drug sets disjoint
-  - cold-protein    : train/test protein sets disjoint
-  - cold-pair       : train/test (drug,protein) pairs disjoint
-  - cold-both       : strict both-cold:
-                      train/test drug disjoint AND protein disjoint
-                      implemented by test = union(drug_in_fold OR prot_in_fold)
+The split protocol follows:
+- 5-fold CV: 4 folds train, 1 fold test
+- validation split: randomly sample 1/8 from the training set
+  => overall ratio train:val:test = 7:1:2 (approximately for cold settings)
+
+Hash ID rules:
+- did = sha1(smiles)[:24]
+- pid = sha1(seq)[:24]
+
+These rules match your feature files naming convention.
 """
 
 from __future__ import annotations
-from typing import List, Tuple, Sequence, Any
+
+import hashlib
+from dataclasses import dataclass
+from typing import Dict, List, Literal, Tuple
+
 import numpy as np
+import pandas as pd
+from sklearn.model_selection import KFold
 
 
-def _rng(seed: int) -> np.random.RandomState:
-    return np.random.RandomState(int(seed) & 0x7FFFFFFF)
+SplitMode = Literal["warm", "cold-drug", "cold-protein", "cold-both"]
 
 
-def _to_np(a) -> np.ndarray:
-    if isinstance(a, np.ndarray):
-        return a
-    return np.asarray(a)
+def sha1_24(text: str) -> str:
+    """Return sha1(text)[:24] as lowercase hex string."""
+    if not isinstance(text, str):
+        text = str(text)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:24]
 
 
-def _normalize_drug_key(k: Any) -> str:
-    return "" if k is None else str(k).strip()
-
-
-def _normalize_prot_key(k: Any) -> str:
-    return "" if k is None else str(k).strip().upper()
-
-
-def _normalize_keys(drug_key: Sequence, prot_key: Sequence) -> Tuple[np.ndarray, np.ndarray]:
-    d = _to_np(drug_key).astype(object, copy=False)
-    p = _to_np(prot_key).astype(object, copy=False)
-    d = np.asarray([_normalize_drug_key(x) for x in d], dtype=object)
-    p = np.asarray([_normalize_prot_key(x) for x in p], dtype=object)
-    return d, p
-
-
-def _is_binary_classification(y: np.ndarray) -> bool:
-    if y.size == 0:
-        return False
-    uniq = np.unique(y)
-    if uniq.size != 2:
-        return False
-    return np.all(np.isin(uniq, [0, 1]))
-
-
-def _pair_keys(drug_key: np.ndarray, prot_key: np.ndarray) -> np.ndarray:
-    return (drug_key.astype(str) + "||" + prot_key.astype(str)).astype(object)
-
-
-def _group_counts(keys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    g, c = np.unique(keys, return_counts=True)
-    return g.astype(object), c.astype(np.int64)
-
-
-def _assign_groups_to_folds_by_size(groups: np.ndarray, counts: np.ndarray, n_splits: int, seed: int) -> List[np.ndarray]:
+def add_hash_ids(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Greedy bin packing by sample counts (more balanced than random group split).
+    Add columns:
+      - did from smiles
+      - pid from seq
     """
-    r = _rng(seed)
-    jitter = r.rand(len(groups))
-    order = np.lexsort((jitter, -counts))  # big first
-    g_sorted = groups[order]
-    c_sorted = counts[order]
-
-    bins: List[List[Any]] = [[] for _ in range(n_splits)]
-    bin_sz = np.zeros((n_splits,), dtype=np.int64)
-
-    for g, c in zip(g_sorted.tolist(), c_sorted.tolist()):
-        k = int(np.argmin(bin_sz))
-        bins[k].append(g)
-        bin_sz[k] += int(c)
-
-    return [np.asarray(b, dtype=object) for b in bins]
+    if "smiles" not in df.columns or "seq" not in df.columns:
+        raise ValueError("CSV must contain columns: smiles, seq")
+    df = df.copy()
+    df["did"] = df["smiles"].astype(str).map(sha1_24)
+    df["pid"] = df["seq"].astype(str).map(sha1_24)
+    return df
 
 
-def _validate_disjoint(a: np.ndarray, b: np.ndarray, msg: str):
-    if np.intersect1d(np.unique(a), np.unique(b)).size != 0:
-        raise ValueError(msg)
-
-
-def _kfold_indices(n: int, n_splits: int, seed: int) -> List[Tuple[np.ndarray, np.ndarray]]:
-    r = _rng(seed)
-    idx = r.permutation(n)
-    folds = np.array_split(idx, n_splits)
-    out = []
-    all_idx = np.arange(n, dtype=np.int64)
-    for k in range(n_splits):
-        te = folds[k].astype(np.int64)
-        tr = np.setdiff1d(all_idx, te, assume_unique=False).astype(np.int64)
-        out.append((tr, te))
-    return out
-
-
-def _stratified_kfold_indices(y: np.ndarray, n_splits: int, seed: int) -> List[Tuple[np.ndarray, np.ndarray]]:
-    r = _rng(seed)
-    idx0 = np.where(y == 0)[0]
-    idx1 = np.where(y == 1)[0]
-    r.shuffle(idx0)
-    r.shuffle(idx1)
-    folds0 = np.array_split(idx0, n_splits)
-    folds1 = np.array_split(idx1, n_splits)
-
-    out = []
-    all_idx = np.arange(len(y), dtype=np.int64)
-    for k in range(n_splits):
-        te = np.concatenate([folds0[k], folds1[k]], axis=0)
-        r.shuffle(te)
-        te = te.astype(np.int64)
-        tr = np.setdiff1d(all_idx, te, assume_unique=False).astype(np.int64)
-        out.append((tr, te))
-    return out
-
-
-def make_outer_splits(
-    split_mode: str,
-    n_splits: int,
-    seed: int,
-    drug_key: Sequence,
-    prot_key: Sequence,
-    y: Sequence,
-) -> List[Tuple[np.ndarray, np.ndarray]]:
-    split_mode = str(split_mode).strip().lower()
-    y = _to_np(y).astype(np.float32, copy=False)
-    n = len(y)
-
-    d_raw = _to_np(drug_key)
-    p_raw = _to_np(prot_key)
-    assert len(d_raw) == n and len(p_raw) == n, "drug_key/prot_key/y 长度必须一致"
-
-    d, p = _normalize_keys(d_raw, p_raw)
-    all_idx = np.arange(n, dtype=np.int64)
-
-    # warm/hot
-    if split_mode in ("warm", "hot"):
-        try:
-            from sklearn.model_selection import StratifiedKFold, KFold
-            if _is_binary_classification(y):
-                skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-                return [(tr.astype(np.int64), te.astype(np.int64)) for tr, te in skf.split(np.zeros(n), y)]
-            kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-            return [(tr.astype(np.int64), te.astype(np.int64)) for tr, te in kf.split(np.zeros(n))]
-        except Exception:
-            if _is_binary_classification(y):
-                return _stratified_kfold_indices(y, n_splits, seed)
-            return _kfold_indices(n, n_splits, seed)
-
-    # cold-drug
-    if split_mode == "cold-drug":
-        groups, counts = _group_counts(d)
-        folds = _assign_groups_to_folds_by_size(groups, counts, n_splits, seed)
-        out = []
-        for k in range(n_splits):
-            te = np.where(np.isin(d, folds[k]))[0].astype(np.int64)
-            tr = np.setdiff1d(all_idx, te, assume_unique=False).astype(np.int64)
-            _validate_disjoint(d[tr], d[te], "cold-drug violated: drug overlap between train/test")
-            out.append((tr, te))
-        return out
-
-    # cold-protein
-    if split_mode == "cold-protein":
-        groups, counts = _group_counts(p)
-        folds = _assign_groups_to_folds_by_size(groups, counts, n_splits, seed)
-        out = []
-        for k in range(n_splits):
-            te = np.where(np.isin(p, folds[k]))[0].astype(np.int64)
-            tr = np.setdiff1d(all_idx, te, assume_unique=False).astype(np.int64)
-            _validate_disjoint(p[tr], p[te], "cold-protein violated: protein overlap between train/test")
-            out.append((tr, te))
-        return out
-
-    # cold-pair
-    if split_mode == "cold-pair":
-        pair = _pair_keys(d, p)
-        groups, counts = _group_counts(pair)
-        folds = _assign_groups_to_folds_by_size(groups, counts, n_splits, seed)
-        out = []
-        for k in range(n_splits):
-            te = np.where(np.isin(pair, folds[k]))[0].astype(np.int64)
-            tr = np.setdiff1d(all_idx, te, assume_unique=False).astype(np.int64)
-            _validate_disjoint(pair[tr], pair[te], "cold-pair violated: pair overlap between train/test")
-            out.append((tr, te))
-        return out
-
-    # cold-both (strict): test = union(drug in fold OR protein in fold)
-    if split_mode == "cold-both":
-        d_groups, d_counts = _group_counts(d)
-        p_groups, p_counts = _group_counts(p)
-
-        d_folds = _assign_groups_to_folds_by_size(d_groups, d_counts, n_splits, seed)
-        p_folds = _assign_groups_to_folds_by_size(p_groups, p_counts, n_splits, seed + 9973)
-
-        out = []
-        for k in range(n_splits):
-            mask_d = np.isin(d, d_folds[k])
-            mask_p = np.isin(p, p_folds[k])
-            te = np.where(mask_d | mask_p)[0].astype(np.int64)
-            tr = np.setdiff1d(all_idx, te, assume_unique=False).astype(np.int64)
-            _validate_disjoint(d[tr], d[te], "cold-both violated: drug overlap between train/test")
-            _validate_disjoint(p[tr], p[te], "cold-both violated: protein overlap between train/test")
-            out.append((tr, te))
-        return out
-
-    raise ValueError(f"Unknown split_mode: {split_mode}")
-
-
-def sample_val_indices(
-    split_mode: str,
-    train_idx: np.ndarray,
-    val_frac: float,
-    seed: int,
-    drug_key: Sequence,
-    prot_key: Sequence,
-    y: Sequence,
-) -> Tuple[np.ndarray, np.ndarray]:
+def sanitize_label_series(label: pd.Series) -> pd.Series:
     """
-    Split outer-train indices into (train_sub, val) according to split_mode.
-    For group-based splits, val is selected by groups to approximate val_frac by sample count.
+    Ensure binary {0,1} labels.
+
+    - If labels already only contain {0,1}, keep them.
+    - Otherwise, binarize with threshold 0.5 (common when labels are floats 0/1).
     """
-    split_mode = str(split_mode).strip().lower()
-    train_idx = _to_np(train_idx).astype(np.int64)
-    y = _to_np(y).astype(np.float32, copy=False)
+    y = pd.to_numeric(label, errors="coerce").fillna(0.0)
+    uniq = sorted(y.unique().tolist())
+    if set(uniq).issubset({0, 1}) and len(uniq) <= 2:
+        return y.astype(int)
+    return (y.astype(float) >= 0.5).astype(int)
 
-    if train_idx.size == 0:
-        return train_idx, train_idx
 
-    d_raw = _to_np(drug_key)
-    p_raw = _to_np(prot_key)
-    d, p = _normalize_keys(d_raw, p_raw)
+@dataclass
+class FoldSplit:
+    fold: int
+    train_idx: np.ndarray
+    val_idx: np.ndarray
+    test_idx: np.ndarray
 
-    n_tr = train_idx.size
-    val_frac = float(val_frac)
-    val_target = max(1, int(round(val_frac * n_tr)))
-    r = _rng(seed)
+    def as_dict(self) -> Dict[str, np.ndarray]:
+        return {"train": self.train_idx, "val": self.val_idx, "test": self.test_idx}
 
-    # warm/hot
-    if split_mode in ("warm", "hot"):
-        try:
-            from sklearn.model_selection import StratifiedShuffleSplit
-            if _is_binary_classification(y):
-                sss = StratifiedShuffleSplit(n_splits=1, test_size=val_frac, random_state=seed)
-                idx_in = train_idx
-                y_in = y[idx_in]
-                tr_sub_in, va_in = next(sss.split(np.zeros_like(y_in), y_in))
-                return idx_in[tr_sub_in].astype(np.int64), idx_in[va_in].astype(np.int64)
-        except Exception:
-            pass
-        idx = train_idx.copy()
-        r.shuffle(idx)
-        va = idx[:val_target]
-        tr_sub = idx[val_target:]
-        return tr_sub.astype(np.int64), va.astype(np.int64)
 
-    def _pick_groups_by_count(keys_local: np.ndarray) -> np.ndarray:
-        groups, counts = np.unique(keys_local, return_counts=True)
-        counts = counts.astype(np.int64)
+def _split_entities_to_folds(entities: np.ndarray, n_splits: int, seed: int) -> List[np.ndarray]:
+    """Shuffle unique entities and split into n_splits folds."""
+    rng = np.random.RandomState(seed)
+    ent = np.array(entities, dtype=object)
+    rng.shuffle(ent)
+    folds = np.array_split(ent, n_splits)
+    return folds
 
-        jitter = r.rand(len(groups))
-        order = np.lexsort((jitter, -counts))  # big first
-        g_sorted = groups[order]
-        c_sorted = counts[order]
 
-        picked = []
-        acc = 0
-        for g, c in zip(g_sorted.tolist(), c_sorted.tolist()):
-            if acc >= val_target and picked:
-                break
-            if len(picked) >= len(groups) - 1:
-                break
-            picked.append(g)
-            acc += int(c)
+def _sample_val_from_train(train_idx: np.ndarray, val_ratio: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (train_idx2, val_idx) by sampling from train_idx."""
+    rng = np.random.RandomState(seed)
+    train_idx = np.array(train_idx, dtype=int)
+    rng.shuffle(train_idx)
+    n_val = max(1, int(round(len(train_idx) * val_ratio)))
+    val_idx = train_idx[:n_val]
+    train_idx2 = train_idx[n_val:]
+    return train_idx2, val_idx
 
-        picked = np.asarray(picked, dtype=object)
-        return np.isin(keys_local, picked)
 
-    if split_mode == "cold-drug":
-        keys_local = d[train_idx]
-        m = _pick_groups_by_count(keys_local)
-        va = train_idx[m]
-        tr_sub = train_idx[~m]
-        _validate_disjoint(d[tr_sub], d[va], "cold-drug (val) violated: drug overlap between train_sub/val")
-        return tr_sub.astype(np.int64), va.astype(np.int64)
+def make_five_fold_splits(
+    df: pd.DataFrame,
+    mode: SplitMode,
+    n_splits: int = 5,
+    seed: int = 42,
+    val_ratio_in_train: float = 1.0 / 8.0,
+) -> List[FoldSplit]:
+    """
+    Create 5 folds.
 
-    if split_mode == "cold-protein":
-        keys_local = p[train_idx]
-        m = _pick_groups_by_count(keys_local)
-        va = train_idx[m]
-        tr_sub = train_idx[~m]
-        _validate_disjoint(p[tr_sub], p[va], "cold-protein (val) violated: protein overlap between train_sub/val")
-        return tr_sub.astype(np.int64), va.astype(np.int64)
+    Returns a list of FoldSplit (fold id starts from 1).
+    """
+    if "did" not in df.columns or "pid" not in df.columns:
+        raise ValueError("DataFrame must include did & pid. Call add_hash_ids() first.")
 
-    if split_mode == "cold-pair":
-        pair = _pair_keys(d, p)
-        keys_local = pair[train_idx]
-        m = _pick_groups_by_count(keys_local)
-        va = train_idx[m]
-        tr_sub = train_idx[~m]
-        _validate_disjoint(pair[tr_sub], pair[va], "cold-pair (val) violated: pair overlap between train_sub/val")
-        return tr_sub.astype(np.int64), va.astype(np.int64)
+    df = df.reset_index(drop=True)
+    n = len(df)
+    all_idx = np.arange(n, dtype=int)
 
-    # cold-both val: strict union(drug in val_drugs OR prot in val_prots)
-    if split_mode == "cold-both":
-        local_d = d[train_idx]
-        local_p = p[train_idx]
+    splits: List[FoldSplit] = []
 
-        u_d, inv_d = np.unique(local_d, return_inverse=True)
-        cnt_d = np.bincount(inv_d).astype(np.int64)
-        u_p, inv_p = np.unique(local_p, return_inverse=True)
-        cnt_p = np.bincount(inv_p).astype(np.int64)
+    if mode == "warm":
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        for fold, (trainval_idx, test_idx) in enumerate(kf.split(all_idx), start=1):
+            train_idx, val_idx = _sample_val_from_train(trainval_idx, val_ratio_in_train, seed + fold)
+            splits.append(FoldSplit(fold=fold, train_idx=train_idx, val_idx=val_idx, test_idx=np.array(test_idx)))
+        return splits
 
-        # if too few groups, fallback to random (cannot guarantee strict both-cold inside train pool)
-        if u_d.size < 2 or u_p.size < 2:
-            idx = train_idx.copy()
-            r.shuffle(idx)
-            va = idx[:val_target]
-            tr_sub = idx[val_target:]
-            return tr_sub.astype(np.int64), va.astype(np.int64)
+    if mode in ("cold-drug", "cold-protein"):
+        group_col = "did" if mode == "cold-drug" else "pid"
+        uniq = df[group_col].unique()
+        folds = _split_entities_to_folds(uniq, n_splits=n_splits, seed=seed)
 
-        # group -> positions (local positions)
-        order_d = np.argsort(inv_d)
-        start_d = np.cumsum(cnt_d) - cnt_d
-        end_d = np.cumsum(cnt_d)
-        pos_d = [order_d[start_d[i]:end_d[i]] for i in range(u_d.size)]
+        for fold in range(1, n_splits + 1):
+            test_groups = set(folds[fold - 1].tolist())
+            is_test = df[group_col].isin(test_groups).values
+            test_idx = all_idx[is_test]
+            trainval_idx = all_idx[~is_test]
+            train_idx, val_idx = _sample_val_from_train(trainval_idx, val_ratio_in_train, seed + fold)
+            splits.append(FoldSplit(fold=fold, train_idx=train_idx, val_idx=val_idx, test_idx=test_idx))
+        return splits
 
-        order_p = np.argsort(inv_p)
-        start_p = np.cumsum(cnt_p) - cnt_p
-        end_p = np.cumsum(cnt_p)
-        pos_p = [order_p[start_p[i]:end_p[i]] for i in range(u_p.size)]
+    if mode == "cold-both":
+        # Strict: test uses (did in D_fold) AND (pid in P_fold).
+        # Train removes any pair containing those test dids or pids => no leakage.
+        did_folds = _split_entities_to_folds(df["did"].unique(), n_splits=n_splits, seed=seed)
+        pid_folds = _split_entities_to_folds(df["pid"].unique(), n_splits=n_splits, seed=seed + 999)
 
-        cand = []
-        for i in range(u_d.size):
-            cand.append(("drug", i, int(cnt_d[i])))
-        for i in range(u_p.size):
-            cand.append(("prot", i, int(cnt_p[i])))
+        for fold in range(1, n_splits + 1):
+            test_dids = set(did_folds[fold - 1].tolist())
+            test_pids = set(pid_folds[fold - 1].tolist())
 
-        jitter = r.rand(len(cand))
-        sizes_neg = np.asarray([-c[2] for c in cand], dtype=np.int64)
-        ord2 = np.lexsort((jitter, sizes_neg))
-        cand = [cand[i] for i in ord2.tolist()]
+            is_test = df["did"].isin(test_dids).values & df["pid"].isin(test_pids).values
+            is_forbidden_for_train = df["did"].isin(test_dids).values | df["pid"].isin(test_pids).values
 
-        sel = np.zeros((train_idx.size,), dtype=bool)
-        covered = 0
-        picked_d = set()
-        picked_p = set()
+            test_idx = all_idx[is_test]
+            trainval_idx = all_idx[~is_forbidden_for_train]
 
-        for typ, gi, _sz in cand:
-            if covered >= val_target:
-                break
+            train_idx, val_idx = _sample_val_from_train(trainval_idx, val_ratio_in_train, seed + fold)
+            splits.append(FoldSplit(fold=fold, train_idx=train_idx, val_idx=val_idx, test_idx=test_idx))
+        return splits
 
-            if typ == "drug":
-                if len(picked_d) >= u_d.size - 1:
-                    continue
-                pos = pos_d[gi]
-                picked_d.add(gi)
-            else:
-                if len(picked_p) >= u_p.size - 1:
-                    continue
-                pos = pos_p[gi]
-                picked_p.add(gi)
-
-            new_cnt = int((~sel[pos]).sum())
-            if new_cnt == 0:
-                continue
-            sel[pos] = True
-            covered += new_cnt
-
-        va = train_idx[sel]
-        tr_sub = train_idx[~sel]
-
-        _validate_disjoint(d[tr_sub], d[va], "cold-both (val) violated: drug overlap between train_sub/val")
-        _validate_disjoint(p[tr_sub], p[va], "cold-both (val) violated: protein overlap between train_sub/val")
-        return tr_sub.astype(np.int64), va.astype(np.int64)
-
-    raise ValueError(f"Unknown split_mode: {split_mode}")
+    raise ValueError(f"Unknown split mode: {mode}")

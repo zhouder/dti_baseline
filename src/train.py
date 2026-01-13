@@ -1,608 +1,506 @@
-# src/train.py
-# -*- coding: utf-8 -*-
+"""
+train.py
+
+5-fold CV training script for UGCA-DTI with:
+- tqdm progress bars
+- per-epoch logging to CSV
+- best checkpoint by val AUPRC
+- last checkpoint for resume
+- early stopping by patience (#epochs without AUPRC improvement)
+
+Output layout:
+{out_root}/{DATASET}_{split_mode}/
+  ├── summary.csv
+  ├── fold1/
+  │    ├── log.csv
+  │    ├── result.csv
+  │    ├── best.pt
+  │    └── last.pt
+  ├── fold2/
+  │    └── ...
+  ...
+"""
+
 from __future__ import annotations
 
 import argparse
 import csv
-import importlib
-import inspect
+import os
 import time
+from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
-from torch import nn, optim
-from torch.utils.data import DataLoader
-import torch.multiprocessing as mp
-
-try:
-    mp.set_sharing_strategy("file_system")
-except RuntimeError:
-    pass
-
+import torch.nn as nn
 from tqdm import tqdm
 
-from src.datamodule import (
-    DataModule, DMConfig, CacheDirs, CacheDims,
-    read_smiles_protein_label,
-)
+import warnings
+warnings.filterwarnings('ignore', message='The verbose parameter is deprecated.*')
 
-from src.splits import make_outer_splits, sample_val_indices
-
-# metrics
-SKLEARN = True
 try:
-    from sklearn.metrics import (
-        roc_auc_score, average_precision_score, f1_score,
-        accuracy_score, recall_score, matthews_corrcoef
-    )
-except Exception:
-    SKLEARN = False
+    from .datamodule import DTIDataModule
+except ImportError:
+    try:
+        from src.datamodule import DTIDataModule
+    except ImportError:
+        from datamodule import DTIDataModule
+try:
+    from .model import ModelConfig, UGCADTI
+except ImportError:
+    try:
+        from src.model import ModelConfig, UGCADTI
+    except ImportError:
+        from model import ModelConfig, UGCADTI
+try:
+    from .splits import SplitMode, add_hash_ids, make_five_fold_splits, sanitize_label_series
+except ImportError:
+    try:
+        from src.splits import SplitMode, add_hash_ids, make_five_fold_splits, sanitize_label_series
+    except ImportError:
+        from splits import SplitMode, add_hash_ids, make_five_fold_splits, sanitize_label_series
 
 
-def set_seed(seed: int):
+# ----------------------------
+# Utils
+# ----------------------------
+
+def set_seed(seed: int) -> None:
     import random
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-def compute_metrics(prob: np.ndarray, lab: np.ndarray) -> Dict[str, float]:
-    if prob is None or lab is None or prob.size == 0:
-        return {k: float("nan") for k in ["auc", "auprc", "f1", "acc", "recall", "mcc"]}
-
-    y_true = lab.astype(np.int32)
-    y_score = prob.astype(np.float32)
-    y_pred = (y_score >= 0.5).astype(np.int32)
-
-    if not SKLEARN:
-        return {
-            "auc": float("nan"),
-            "auprc": float("nan"),
-            "f1": float("nan"),
-            "acc": float((y_pred == y_true).mean()),
-            "recall": float("nan"),
-            "mcc": float("nan"),
-        }
-
-    out = {}
+def safe_auroc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    from sklearn.metrics import roc_auc_score
     try:
-        out["auc"] = float(roc_auc_score(y_true, y_score))
+        if len(np.unique(y_true)) < 2:
+            return float("nan")
+        return float(roc_auc_score(y_true, y_prob))
     except Exception:
-        out["auc"] = float("nan")
+        return float("nan")
+
+
+def safe_auprc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    from sklearn.metrics import average_precision_score
     try:
-        out["auprc"] = float(average_precision_score(y_true, y_score))
+        return float(average_precision_score(y_true, y_prob))
     except Exception:
-        out["auprc"] = float("nan")
-    try:
-        out["f1"] = float(f1_score(y_true, y_pred))
-    except Exception:
-        out["f1"] = float("nan")
-    try:
-        out["acc"] = float(accuracy_score(y_true, y_pred))
-    except Exception:
-        out["acc"] = float("nan")
-    try:
-        out["recall"] = float(recall_score(y_true, y_pred))
-    except Exception:
-        out["recall"] = float("nan")
-    try:
-        out["mcc"] = float(matthews_corrcoef(y_true, y_pred))
-    except Exception:
-        out["mcc"] = float("nan")
-    return out
+        return float("nan")
 
 
-def _batch_to_device(batch, device: torch.device):
-    if isinstance(batch, (list, tuple)):
-        out = []
-        for x in batch:
-            out.append(x.to(device) if torch.is_tensor(x) else x)
-        return tuple(out)
-    return batch.to(device) if torch.is_tensor(batch) else batch
+def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
+    y_true = y_true.astype(int)
+    y_prob = y_prob.astype(float)
+    y_pred = (y_prob >= threshold).astype(int)
 
+    # confusion
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    total = tp + tn + fp + fn
 
-def _forward(model: nn.Module, batch):
-    # batch: (P,Pm,D,Dm,C,pocket_list,y)
-    P, Pm, D, Dm, C, pocket_list, y = batch
-    logits = model(P, Pm, D, Dm, C, pocket_list)
-    return logits, y
+    acc = (tp + tn) / total if total > 0 else float("nan")
+    sen = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    f1 = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0
 
+    # MCC
+    denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    if denom <= 0:
+        mcc = float("nan")
+    else:
+        mcc = (tp * tn - fp * fn) / (denom ** 0.5)
 
-def build_model_from_src(dims: CacheDims, args) -> nn.Module:
-    model_mod = importlib.import_module("src.model")
+    auroc = safe_auroc(y_true, y_prob)
+    auprc = safe_auprc(y_true, y_prob)
 
-    if hasattr(model_mod, "build_model"):
-        cfg = {
-            "d_protein": int(dims.esm2),
-            "d_molclr": int(dims.molclr),
-            "d_chem": int(dims.chemberta),
-
-            "d_model": int(args.d_model),
-            "dropout": float(args.dropout),
-
-            # compat keys
-            "n_heads": int(args.n_heads),
-            "nhead": int(args.n_heads),
-            "n_layers": int(args.n_layers),
-            "nlayers": int(args.n_layers),
-
-            "pocket_in_dim": int(args.pocket_in_dim),
-            "pocket_hidden": int(args.pocket_hidden),
-        }
-        return model_mod.build_model(cfg)
-
-    if args.model_class:
-        for name, c in inspect.getmembers(model_mod, inspect.isclass):
-            if name == args.model_class and issubclass(c, nn.Module):
-                return c(dims)
-
-    raise RuntimeError("找不到模型：请在 src/model.py 提供 build_model(cfg) 或 --model-class")
-
-
-def _write_log_header(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.stat().st_size > 0:
-        return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "epoch", "lr",
-            "train_loss", "train_auc", "train_auprc", "train_f1", "train_acc", "train_recall", "train_mcc",
-            "val_loss",   "val_auc",   "val_auprc",   "val_f1",   "val_acc",   "val_recall",   "val_mcc",
-            "is_best_val_auprc",
-            "time_sec",
-        ])
-
-
-def _append_log(path: Path, row: list):
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
-
-
-def _save_kv_csv(path: Path, kv: Dict[str, float | int | str]):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        for k, v in kv.items():
-            w.writerow([k, v])
-
-
-def _load_kv_csv(path: Path) -> Dict[str, str]:
-    if not path.exists():
-        return {}
-    out = {}
-    with open(path, "r", encoding="utf-8") as f:
-        r = csv.reader(f)
-        for row in r:
-            if len(row) >= 2:
-                out[row[0]] = row[1]
-    return out
-
-
-def _optimizer_to_device(optimizer: optim.Optimizer, device: torch.device):
-    for st in optimizer.state.values():
-        for k, v in st.items():
-            if torch.is_tensor(v):
-                st[k] = v.to(device)
-
-
-def _save_resume_state(path: Path, epoch: int, optimizer: optim.Optimizer, scheduler,
-                      best_val_auprc: float, bad_cnt: int, scaler=None):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "epoch": int(epoch),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": (scheduler.state_dict() if scheduler is not None else None),
-        "best_val_auprc": float(best_val_auprc),
-        "bad_cnt": int(bad_cnt),
-        "scaler": (scaler.state_dict() if scaler is not None else None),
-    }, path)
-
-
-def _try_resume(state_path: Path, last_path: Path, model: nn.Module,
-                optimizer: optim.Optimizer, scheduler, device: torch.device, scaler=None):
-    st = torch.load(state_path, map_location="cpu")
-    sd = torch.load(last_path, map_location="cpu")
-    model.load_state_dict(sd, strict=False)
-
-    optimizer.load_state_dict(st["optimizer"])
-    _optimizer_to_device(optimizer, device)
-
-    if scheduler is not None and st.get("scheduler") is not None:
-        try:
-            scheduler.load_state_dict(st["scheduler"])
-        except Exception:
-            pass
-
-    if scaler is not None and st.get("scaler") is not None:
-        try:
-            scaler.load_state_dict(st["scaler"])
-        except Exception:
-            pass
-
-    start_epoch = int(st.get("epoch", 0)) + 1
-    best_val_auprc = float(st.get("best_val_auprc", -1.0))
-    bad_cnt = int(st.get("bad_cnt", 0))
-    return start_epoch, best_val_auprc, bad_cnt
-
-
-def train_epoch_collect_metrics(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    optimizer: optim.Optimizer,
-    amp: str = "off",
-    scaler=None,
-    amp_dtype=None
-) -> Tuple[float, Dict[str, float]]:
-    model.train(True)
-    crit = nn.BCEWithLogitsLoss()
-
-    loss_sum = 0.0
-    n = 0
-    probs, labs = [], []
-
-    pbar = tqdm(total=len(loader.dataset), ncols=120, unit="ex", leave=True)
-    for batch in loader:
-        batch = _batch_to_device(batch, device)
-        optimizer.zero_grad(set_to_none=True)
-
-        if amp != "off":
-            with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"),
-                                dtype=amp_dtype, enabled=True):
-                logits, y = _forward(model, batch)
-                loss = crit(logits, y)
-        else:
-            logits, y = _forward(model, batch)
-            loss = crit(logits, y)
-
-        if amp == "fp16":
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
-
-        bs = int(y.shape[0])
-        loss_sum += float(loss.detach().item()) * bs
-        n += bs
-
-        with torch.no_grad():
-            probs.append(torch.sigmoid(logits.detach()).float().cpu().numpy())
-            labs.append(y.detach().float().cpu().numpy())
-
-        pbar.update(bs)
-        pbar.set_postfix(loss=f"{loss_sum/max(1,n):.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
-
-    pbar.close()
-
-    prob_all = np.concatenate(probs, axis=0) if probs else np.zeros((0,), dtype=np.float32)
-    lab_all = np.concatenate(labs, axis=0) if labs else np.zeros((0,), dtype=np.float32)
-    met = compute_metrics(prob_all, lab_all)
-    return loss_sum / max(1, n), met
+    return {
+        "AUPRC": auprc,
+        "AUROC": auroc,
+        "F1": float(f1),
+        "ACC": float(acc),
+        "SEN": float(sen),
+        "MCC": float(mcc),
+        "TP": float(tp),
+        "TN": float(tn),
+        "FP": float(fp),
+        "FN": float(fn),
+    }
 
 
 @torch.no_grad()
-def eval_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
-               amp: str = "off", amp_dtype=None) -> Tuple[float, Dict[str, float]]:
-    model.train(False)
-    crit = nn.BCEWithLogitsLoss()
-
-    loss_sum = 0.0
-    n = 0
-    probs, labs = [], []
-
+def run_eval(model: nn.Module, loader, device: torch.device, criterion: nn.Module) -> Tuple[float, Dict[str, float]]:
+    model.eval()
+    losses = []
+    all_probs = []
+    all_labels = []
     for batch in loader:
-        batch = _batch_to_device(batch, device)
+        molclr = batch["molclr"].to(device)
+        chemberta = batch["chemberta"].to(device)
+        esm2 = batch["esm2"].to(device)
+        pocket = batch["pocket"].to(device)
+        y = batch["label"].to(device)
 
-        if amp != "off":
-            with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"),
-                                dtype=amp_dtype, enabled=True):
-                logits, y = _forward(model, batch)
-                loss = crit(logits, y)
-        else:
-            logits, y = _forward(model, batch)
-            loss = crit(logits, y)
+        logits = model(molclr, chemberta, esm2, pocket)
+        loss = criterion(logits, y)
+        losses.append(loss.item())
 
-        bs = int(y.shape[0])
-        loss_sum += float(loss.detach().item()) * bs
-        n += bs
+        prob = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
+        lab = y.detach().cpu().numpy().reshape(-1)
+        all_probs.append(prob)
+        all_labels.append(lab)
 
-        probs.append(torch.sigmoid(logits.detach()).float().cpu().numpy())
-        labs.append(y.detach().float().cpu().numpy())
+    y_prob = np.concatenate(all_probs, axis=0) if all_probs else np.array([])
+    y_true = np.concatenate(all_labels, axis=0) if all_labels else np.array([])
 
-    prob_all = np.concatenate(probs, axis=0) if probs else np.zeros((0,), dtype=np.float32)
-    lab_all = np.concatenate(labs, axis=0) if labs else np.zeros((0,), dtype=np.float32)
-    met = compute_metrics(prob_all, lab_all)
-    return loss_sum / max(1, n), met
+    metrics = compute_metrics(y_true, y_prob) if len(y_true) > 0 else {k: float("nan") for k in ["AUPRC","AUROC","F1","ACC","SEN","MCC"]}
+    return float(np.mean(losses) if losses else float("nan")), metrics
 
 
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", required=True)
-    ap.add_argument("--data-root", type=str, default="/root/lanyun-tmp")
-    ap.add_argument("--cache-root", type=str, default="/root/lanyun-tmp/cache")
-    ap.add_argument("--out", type=str, default="/root/lanyun-tmp/ugca-runs")
-    ap.add_argument("--resume", action="store_true")
+def run_train_epoch(
+    model: nn.Module,
+    loader,
+    device: torch.device,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    grad_clip: Optional[float] = None,
+    desc: str = "",
+) -> Tuple[float, Dict[str, float]]:
+    model.train()
+    losses = []
+    all_probs = []
+    all_labels = []
 
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--cv-folds", type=int, default=5)
-    ap.add_argument("--split-mode",
-                    choices=["warm", "hot", "cold-protein", "cold-drug", "cold-both", "cold-pair"],
-                    default="warm")
+    pbar = tqdm(loader, desc=desc, leave=False)
+    for batch in pbar:
+        molclr = batch["molclr"].to(device)
+        chemberta = batch["chemberta"].to(device)
+        esm2 = batch["esm2"].to(device)
+        pocket = batch["pocket"].to(device)
+        y = batch["label"].to(device)
 
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=5e-4)
-    ap.add_argument("--weight-decay", type=float, default=1e-4)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(molclr, chemberta, esm2, pocket)
+        loss = criterion(logits, y)
+        loss.backward()
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
 
-    ap.add_argument("--lr-sched", choices=["off", "cosine"], default="cosine")
-    ap.add_argument("--eta-min", type=float, default=1e-6)
-    ap.add_argument("--cosine-frac", type=float, default=0.5,
-                    help="前 cosine_frac*epochs 衰减到 eta_min")
+        losses.append(loss.item())
+        prob = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
+        lab = y.detach().cpu().numpy().reshape(-1)
+        all_probs.append(prob)
+        all_labels.append(lab)
 
-    ap.add_argument("--early-stop", type=int, default=10)
-    ap.add_argument("--es-min-delta", type=float, default=1e-4)
+        pbar.set_postfix({"loss": f"{np.mean(losses):.4f}"})
 
-    ap.add_argument("--amp", choices=["off", "fp16", "bf16"], default="bf16")
-    ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    y_prob = np.concatenate(all_probs, axis=0) if all_probs else np.array([])
+    y_true = np.concatenate(all_labels, axis=0) if all_labels else np.array([])
 
-    ap.add_argument("--model-class", default="")
+    metrics = compute_metrics(y_true, y_prob) if len(y_true) > 0 else {k: float("nan") for k in ["AUPRC","AUROC","F1","ACC","SEN","MCC"]}
+    return float(np.mean(losses) if losses else float("nan")), metrics
 
-    ap.add_argument("--d-model", type=int, default=512)
-    ap.add_argument("--n-heads", type=int, default=4)
-    ap.add_argument("--n-layers", type=int, default=2)
-    ap.add_argument("--dropout", type=float, default=0.1)
 
-    # pocket hyperparams still configurable (but pocket is always used)
-    ap.add_argument("--pocket-in-dim", type=int, default=21)
-    ap.add_argument("--pocket-hidden", type=int, default=128)
+def save_checkpoint(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(state, str(path))
 
-    return ap.parse_args()
 
+def load_checkpoint(path: Path, map_location: str = "cpu") -> dict:
+    return torch.load(str(path), map_location=map_location)
+
+
+def append_log_row(log_path: Path, row: Dict) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not log_path.exists()
+    with log_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def write_result_csv(path: Path, metrics: Dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame([metrics])
+    df.to_csv(path, index=False)
+
+
+# ----------------------------
+# Main
+# ----------------------------
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, required=True, choices=["davis","kiba","drugbank","DAVIS","KIBA","DRUGBANK"])
+    parser.add_argument("--split", type=str, required=True, choices=["warm","cold-drug","cold-protein","cold-both"])
+    parser.add_argument("--out_root", type=str, default="/root/lanyun-tmp/ugca-runs")
+    parser.add_argument("--root_dir", type=str, default="/root/lanyun-fs")
+    parser.add_argument("--seed", type=int, default=42)
+
+    # training
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=20, help="Early stop after N epochs without val AUPRC improvement.")
+    parser.add_argument("--grad_clip", type=float, default=0.0)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--allow_missing", action="store_true", help="Drop pairs with missing feature files instead of raising.")
+    parser.add_argument("--resume", action="store_true", help="Resume each fold from fold*/last.pt if it exists.")
+
+    # model (lightweight)
+    parser.add_argument("--d_model", type=int, default=256, help="Projection dimension (smaller => lighter).")
+    parser.add_argument("--ugca_layers", type=int, default=1, help="UGCA layers (1 recommended for lightweight).")
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--pocket_use_edge", action="store_true", help="Include edge pooled features for pocket vector.")
+
+    args = parser.parse_args()
     set_seed(args.seed)
 
-    ds_lower = args.dataset.strip().lower()
-    ds = {"bindingdb": "BindingDB", "davis": "DAVIS", "biosnap": "BioSNAP"}.get(ds_lower, args.dataset)
+    dataset = args.dataset.lower()
+    split_mode: SplitMode = args.split  # type: ignore
 
-    data_root = Path(args.data_root)
-    cache_root = Path(args.cache_root) if args.cache_root else (data_root / "cache")
-    all_csv = data_root / ds / "all.csv"
-    if not all_csv.exists():
-        raise FileNotFoundError(f"未找到 {all_csv}")
+    out_dir = Path(args.out_root) / f"{dataset.upper()}_{split_mode}"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    smiles, proteins, labels = read_smiles_protein_label(str(all_csv))
-    N = len(labels)
-    print(f"[ALL] loaded {N} rows from {all_csv}")
+    # Load full dataframe once (for generating splits)
+    csv_path = Path(args.root_dir) / dataset / f"{dataset}.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    df_all = pd.read_csv(csv_path)
+    df_all = add_hash_ids(df_all)
+    df_all["label"] = sanitize_label_series(df_all["label"])
 
-    device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
-    print(f"[Device] {device}")
+    folds = make_five_fold_splits(df_all, mode=split_mode, n_splits=5, seed=args.seed, val_ratio_in_train=1/8)
 
-    # AMP
-    amp = args.amp
-    amp_dtype = None
-    scaler = None
-    if amp == "fp16":
-        amp_dtype = torch.float16
-        scaler = torch.cuda.amp.GradScaler()
-    elif amp == "bf16":
-        amp_dtype = torch.bfloat16
+    fold_results: List[Dict[str, float]] = []
 
-    # cache dirs
-    cache_dirs = CacheDirs(
-        esm_dir=str(cache_root / "esm2" / ds),
-        molclr_dir=str(cache_root / "molclr" / ds),
-        chemberta_dir=str(cache_root / "chemberta" / ds),
-        pocket_dir=str(cache_root / "pocket" / ds),
-    )
-    dims = CacheDims(esm2=1280, molclr=300, chemberta=384)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
-    drug_key = np.asarray(smiles, dtype=object)
-    prot_key = np.asarray(proteins, dtype=object)
-    y_arr = np.asarray(labels, dtype=np.float32)
-
-    split_mode = "warm" if args.split_mode == "hot" else args.split_mode
-    outer_splits = make_outer_splits(split_mode, args.cv_folds, args.seed, drug_key, prot_key, y_arr)
-
-    # enforce 7:1:2 overall => val_frac_in_pool = 0.1 / (1 - 1/K)
-    K = len(outer_splits)
-    val_frac_in_pool = 0.10 / (1.0 - 1.0 / K)
-    print(f"[SPLIT] target train/val/test = 0.70/0.10/0.20 | K={K} | val_frac_in_pool={val_frac_in_pool:.4f}")
-
-    run_dir = Path(args.out) / f"{ds}_{args.split_mode}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[OUT] {run_dir}")
-
-    keys = ["auc", "auprc", "f1", "acc", "recall", "mcc"]
-    fold_metrics: List[Dict[str, float]] = []
-
-    for fold, (train_idx, test_idx) in enumerate(outer_splits, start=1):
-        fold_id = fold - 1
-        train_idx = np.asarray(train_idx)
-        test_idx = np.asarray(test_idx)
-
-        fold_dir = run_dir / f"fold_{fold_id}"
+    for fold_split in folds:
+        fold = fold_split.fold
+        fold_dir = out_dir / f"fold{fold}"
         fold_dir.mkdir(parents=True, exist_ok=True)
-        best_pt = fold_dir / "best.pt"
-        last_pt = fold_dir / "last.pt"
-        log_csv = fold_dir / "log.csv"
-        result_csv = fold_dir / "result.csv"
-        state_pt = fold_dir / ".state.pt"
 
+        print("\n" + "=" * 80)
+        print(f"[{dataset.upper()} | {split_mode}] Fold {fold}/5  ->  {fold_dir}")
         print("=" * 80)
-        print(f"[Fold {fold}/{K}] train_pool={len(train_idx)} test={len(test_idx)} mode={split_mode} pocket=ON")
 
-        if args.resume and result_csv.exists():
-            r = _load_kv_csv(result_csv)
-            if all(k in r for k in keys):
-                fold_metrics.append({k: float(r[k]) for k in keys})
-                print(f"[Resume] fold_{fold_id} already finished (result.csv exists). skip.")
-                continue
+        # Data
+        dm = DTIDataModule(
+            dataset=dataset,
+            train_idx=fold_split.train_idx,
+            val_idx=fold_split.val_idx,
+            test_idx=fold_split.test_idx,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            allow_missing=args.allow_missing,
+            pocket_use_edge=args.pocket_use_edge,
+            root_dir=args.root_dir,
+        )
+        dm.setup(verbose=True)
 
-        tr_idx, va_idx = sample_val_indices(
-            split_mode,
-            train_idx,
-            val_frac_in_pool,
-            args.seed + fold,
-            drug_key,
-            prot_key,
-            y_arr,
+        train_loader = dm.get_dataloader("train", shuffle=True)
+        val_loader = dm.get_dataloader("val", shuffle=False)
+        test_loader = dm.get_dataloader("test", shuffle=False)
+
+        dims = dm.input_dims
+        assert dims is not None
+
+        # Model
+        cfg = ModelConfig(
+            in_molclr=dims["molclr"],
+            in_chemberta=dims["chemberta"],
+            in_esm2=dims["esm2"],
+            in_pocket=dims["pocket"],
+            d_model=args.d_model,
+            ugca_layers=args.ugca_layers,
+            dropout=args.dropout,
+        )
+        model = UGCADTI(cfg).to(device)
+
+        # Loss / optim
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=max(1, args.patience // 3), verbose=False
         )
 
-        def slice_trip(ix: np.ndarray):
-            ix = ix.tolist()
-            return [smiles[i] for i in ix], [proteins[i] for i in ix], [labels[i] for i in ix]
+        # Resume
+        best_path = fold_dir / "best.pt"
+        last_path = fold_dir / "last.pt"
+        log_path = fold_dir / "log.csv"
+        result_path = fold_dir / "result.csv"
 
-        tr = slice_trip(tr_idx)
-        va = slice_trip(va_idx)
-        te = slice_trip(test_idx)
-
-        print(f"[COUNT] train={len(tr_idx)} val={len(va_idx)} test={len(test_idx)} "
-              f"(ratio≈{len(tr_idx)/N:.3f}:{len(va_idx)/N:.3f}:{len(test_idx)/N:.3f})")
-
-        dm = DataModule(
-            DMConfig(
-                train_data=tr, val_data=va, test_data=te,
-                batch_size=args.batch_size,
-                num_workers=args.workers,
-                pin_memory=False,
-                persistent_workers=(args.workers > 0),
-                prefetch_factor=2,
-                drop_last=False,
-            ),
-            cache_dirs=cache_dirs,
-            verbose=False,
-        )
-        s = dm.summary()
-        print(f"[CACHE] esm_dir_used={s['esm_dir_used']} | idx_size={s['index_size']} | hit(train/val/test)={s['hit_rate']}")
-        print(f"[UNIQ] train={s['uniq']['train']} | val={s['uniq']['val']} | test={s['uniq']['test']}")
-
-        train_loader = dm.train_loader()
-        val_loader = dm.val_loader()
-        test_loader = dm.test_loader()
-
-        model = build_model_from_src(dims, args).to(device)
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-        scheduler = None
-        tmax = max(1, int(args.epochs * max(0.05, min(args.cosine_frac, 1.0))))
-        if args.lr_sched == "cosine":
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=tmax, eta_min=args.eta_min)
-            print(f"[LR] cosine: T_max={tmax}, eta_min={args.eta_min}")
-
-        _write_log_header(log_csv)
-
-        best_val_auprc = -1.0
-        bad_cnt = 0
         start_epoch = 1
+        best_val_auprc = -1.0
+        best_epoch = 0
+        bad_epochs = 0
 
-        if args.resume and state_pt.exists() and last_pt.exists():
-            start_epoch, best_val_auprc, bad_cnt = _try_resume(
-                state_pt, last_pt, model, optimizer, scheduler, device, scaler=scaler
-            )
-            print(f"[Resume] fold_{fold_id}: start_epoch={start_epoch}, best_val_auprc={best_val_auprc:.6f}, bad_cnt={bad_cnt}")
+        if args.resume and last_path.exists():
+            ckpt = load_checkpoint(last_path, map_location=str(device))
+            model.load_state_dict(ckpt["model"], strict=True)
+            optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception:
+                pass
 
-        for ep in range(start_epoch, args.epochs + 1):
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            best_val_auprc = float(ckpt.get("best_val_auprc", -1.0))
+            best_epoch = int(ckpt.get("best_epoch", 0))
+            bad_epochs = int(ckpt.get("bad_epochs", 0))
+
+            print(f"[Resume] Loaded {last_path}. start_epoch={start_epoch}, best_val_auprc={best_val_auprc:.6f} (epoch {best_epoch})")
+
+        # Train loop
+        for epoch in range(start_epoch, args.epochs + 1):
             t0 = time.time()
+            lr = float(optimizer.param_groups[0]["lr"])
 
-            tr_loss, tr_met = train_epoch_collect_metrics(
-                model, train_loader, device, optimizer, amp=amp, scaler=scaler, amp_dtype=amp_dtype
+            train_loss, train_metrics = run_train_epoch(
+                model=model,
+                loader=train_loader,
+                device=device,
+                criterion=criterion,
+                optimizer=optimizer,
+                grad_clip=args.grad_clip if args.grad_clip > 0 else None,
+                desc=f"Fold {fold} | Epoch {epoch}/{args.epochs} | train",
             )
-            va_loss, va_met = eval_epoch(model, val_loader, device, amp=amp, amp_dtype=amp_dtype)
+            val_loss, val_metrics = run_eval(model, val_loader, device, criterion)
 
-            cur = va_met.get("auprc", float("nan"))
-            improved = (cur > best_val_auprc + args.es_min_delta) if np.isfinite(cur) else False
+            val_auprc = val_metrics["AUPRC"]
+            scheduler.step(val_auprc if not np.isnan(val_auprc) else -1.0)
+
+            epoch_time = time.time() - t0
+
+            # Check improvement (update best before logging)
+            improved = (not np.isnan(val_auprc)) and (val_auprc > best_val_auprc + 1e-6)
             if improved:
-                prev = best_val_auprc
-                best_val_auprc = float(cur)
-                bad_cnt = 0
-                torch.save(model.state_dict(), best_pt)
-                print(f">>> [BEST] val AUPRC improved: {prev:.6f} -> {best_val_auprc:.6f} | saved best.pt")
+                old = best_val_auprc
+                best_val_auprc = float(val_auprc)
+                best_epoch = epoch
+                bad_epochs = 0
+                print(f"✅ Val AUPRC improved: {old:.6f} -> {best_val_auprc:.6f}. Saving best.pt")
+                save_checkpoint(
+                    best_path,
+                    {
+                        "epoch": epoch,
+                        "model": model.state_dict(),
+                        "cfg": asdict(cfg),
+                        "best_val_auprc": best_val_auprc,
+                        "args": vars(args),
+                    },
+                )
             else:
-                bad_cnt += 1
+                bad_epochs += 1
 
-            torch.save(model.state_dict(), last_pt)
-            _save_resume_state(state_pt, ep, optimizer, scheduler, best_val_auprc, bad_cnt, scaler=scaler)
+            # Console summary (train + val metrics)
+            def fmt_metrics(name: str, m: Dict[str, float]) -> str:
+                return (
+                    f"{name:<5} "
+                    f"AUPRC {m['AUPRC']:>7.4f} | AUROC {m['AUROC']:>7.4f} | "
+                    f"F1 {m['F1']:>7.4f} | ACC {m['ACC']:>7.4f} | "
+                    f"SEN {m['SEN']:>7.4f} | MCC {m['MCC']:>7.4f}"
+                )
 
-            lr_now = float(optimizer.param_groups[0]["lr"])
-            dt = time.time() - t0
+            header = (
+                f"[Fold {fold}][Epoch {epoch:03d}] "
+                f"lr={lr:.2e}  time={epoch_time:>6.1f}s  "
+                f"loss(train/val)={train_loss:.4f}/{val_loss:.4f}  "
+                f"bestAUPRC={best_val_auprc:.4f}  bad={bad_epochs}/{args.patience}"
+            )
+            print(header)
+            print(fmt_metrics("Train", train_metrics))
+            print(fmt_metrics("Val", val_metrics))
 
-            print(f"[Epoch {ep:03d}] train_auprc={tr_met['auprc']:.4f} val_auprc={va_met['auprc']:.4f} "
-                  f"train_loss={tr_loss:.4f} val_loss={va_loss:.4f} lr={lr_now:.2e} time={dt:.1f}s")
+            # Logging row
+            row = {
+                "epoch": epoch,
+                "lr": lr,
+                "time_sec": epoch_time,
+                "train_loss": train_loss,
+                **{f"train_{k}": v for k, v in train_metrics.items() if k in ["AUPRC","AUROC","F1","ACC","SEN","MCC"]},
+                "val_loss": val_loss,
+                **{f"val_{k}": v for k, v in val_metrics.items() if k in ["AUPRC","AUROC","F1","ACC","SEN","MCC"]},
+                "best_val_AUPRC": best_val_auprc,
+                "best_epoch": best_epoch,
+                "improved": int(improved),
+                "bad_epochs": bad_epochs,
+            }
+            append_log_row(log_path, row)
 
-            _append_log(log_csv, [
-                ep, lr_now,
-                float(tr_loss), float(tr_met["auc"]), float(tr_met["auprc"]), float(tr_met["f1"]),
-                float(tr_met["acc"]), float(tr_met["recall"]), float(tr_met["mcc"]),
-                float(va_loss), float(va_met["auc"]), float(va_met["auprc"]), float(va_met["f1"]),
-                float(va_met["acc"]), float(va_met["recall"]), float(va_met["mcc"]),
-                int(improved),
-                float(dt),
-            ])
+            # Save last (for resume)
+            save_checkpoint(
+                last_path,
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_val_auprc": best_val_auprc,
+                    "best_epoch": best_epoch,
+                    "bad_epochs": bad_epochs,
+                    "cfg": asdict(cfg),
+                    "args": vars(args),
+                },
+            )
 
-            if scheduler is not None:
-                if ep <= tmax:
-                    scheduler.step()
-                else:
-                    for pg in optimizer.param_groups:
-                        pg["lr"] = args.eta_min
-
-            if args.early_stop > 0 and bad_cnt >= args.early_stop:
-                print(f"[EarlyStop] no improve for {bad_cnt} epochs. stop.")
+            # Early stop check (after saving)
+            if bad_epochs >= args.patience:
+                print(f"⏹️ Early stopping: no val AUPRC improvement for {args.patience} epochs.")
                 break
 
-        # test with best.pt if exists
-        used = "best.pt" if best_pt.exists() else "last.pt"
-        ckpt = best_pt if best_pt.exists() else last_pt
-        model.load_state_dict(torch.load(ckpt, map_location="cpu"), strict=False)
+        # Test with best checkpoint
+        if not best_path.exists():
+            print("⚠️ best.pt not found (maybe all val AUPRC were NaN). Using last.pt for test.")
+            best_ckpt_path = last_path
+        else:
+            best_ckpt_path = best_path
 
-        te_loss, te_met = eval_epoch(model, test_loader, device, amp=amp, amp_dtype=amp_dtype)
-        fold_metrics.append(te_met)
+        ckpt = load_checkpoint(best_ckpt_path, map_location=str(device))
+        model.load_state_dict(ckpt["model"], strict=True)
 
-        print(f"[TEST] used={used} loss={te_loss:.4f} auc={te_met['auc']:.4f} auprc={te_met['auprc']:.4f} f1={te_met['f1']:.4f}")
+        test_loss, test_metrics = run_eval(model, test_loader, device, criterion)
+        test_metrics = {k: float(v) for k, v in test_metrics.items() if k in ["AUPRC","AUROC","F1","ACC","SEN","MCC"]}
+        test_metrics["loss"] = float(test_loss)
+        test_metrics["best_val_AUPRC"] = float(best_val_auprc)
+        test_metrics["best_epoch"] = int(best_epoch)
 
-        _save_kv_csv(result_csv, {
-            "fold": fold_id,
-            "used_ckpt": used,
-            "test_loss": float(te_loss),
-            "auc": float(te_met["auc"]),
-            "auprc": float(te_met["auprc"]),
-            "f1": float(te_met["f1"]),
-            "acc": float(te_met["acc"]),
-            "recall": float(te_met["recall"]),
-            "mcc": float(te_met["mcc"]),
-            "best_val_auprc": float(best_val_auprc),
-            "pocket": "ON",
-        })
+        write_result_csv(result_path, test_metrics)
+        fold_results.append(test_metrics)
 
-    # summary
-    mean = {k: float(np.nanmean([m[k] for m in fold_metrics])) for k in keys}
-    std = {k: float(np.nanstd([m[k] for m in fold_metrics])) for k in keys}
-    summary_csv = run_dir / "summary.csv"
-    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["fold"] + keys)
-        for i, m in enumerate(fold_metrics):
-            w.writerow([i] + [m[k] for k in keys])
-        w.writerow(["mean"] + [mean[k] for k in keys])
-        w.writerow(["std"] + [std[k] for k in keys])
+        print(f"[Fold {fold}] Test results saved to: {result_path}")
+        print(test_metrics)
 
-    print("=" * 80)
-    print(f"[Saved] {summary_csv}")
-    for k in keys:
-        print(f"  {k}: {mean[k]:.4f} ± {std[k]:.4f}")
+    # Summary
+    summary_path = out_dir / "summary.csv"
+    if len(fold_results) > 0:
+        df_res = pd.DataFrame(fold_results)
+        # compute mean/std for metrics
+        metrics_cols = ["AUPRC","AUROC","F1","ACC","SEN","MCC","loss"]
+        rows = []
+        for m in metrics_cols:
+            vals = df_res[m].astype(float).values
+            mean = float(np.nanmean(vals))
+            std = float(np.nanstd(vals, ddof=1)) if len(vals) > 1 else 0.0
+            rows.append({"metric": m, "mean": mean, "std": std, "mean+-std": f"{mean:.6f}+-{std:.6f}"})
+        df_sum = pd.DataFrame(rows)
+        df_sum.to_csv(summary_path, index=False)
+        print(f"\nSummary saved to: {summary_path}")
+        print(df_sum)
+    else:
+        print("No fold results collected; summary.csv not written.")
 
 
 if __name__ == "__main__":

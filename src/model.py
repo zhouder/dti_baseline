@@ -1,267 +1,252 @@
-# src/model.py
-# -*- coding: utf-8 -*-
+"""
+model.py
+
+A lightweight UGCA-DTI model that trains only small projection/interaction layers.
+All 4 backbone encodings are precomputed offline.
+
+Inputs:
+- molclr vector (D_molclr,)
+- chemberta vector (384,)
+- esm2 vector (1280,) or pooled from (L,1280)
+- pocket_graph pooled vector from GVP features
+
+Core idea:
+- project each modality to a small d_model (default 128)
+- UGCA: uncertainty-gated collaborative attention between {drug modalities} and {protein modalities}
+- lightweight uncertainty-aware fusion head (sum + factorized interactions)
+"""
+
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def masked_mean(x: torch.Tensor, m: torch.Tensor, dim: int = 1, eps: float = 1e-6) -> torch.Tensor:
-    """
-    x: (B, T, D), m: (B, T) bool (True=valid)
-    return: (B, D)
-    """
-    m = m.to(dtype=x.dtype)
-    num = (x * m.unsqueeze(-1)).sum(dim=dim)
-    den = m.sum(dim=dim).clamp_min(eps).unsqueeze(-1)
-    return num / den
-
-
-class PocketGraphEncoder(nn.Module):
-    """
-    Lightweight message passing for pocket graphs (no PyG dependency).
-
-    Input per sample:
-      node_scalar_feat: (N, Fin) float
-      edge_index: (2, E) long  (or (E,2) will be transposed)
-    Output:
-      global graph token: (d_model,)
-    """
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.1):
+class MLPProjector(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, dropout: float) -> None:
         super().__init__()
-        self.fc_in = nn.Linear(in_dim, hidden_dim)
-        self.fc_self = nn.Linear(hidden_dim, hidden_dim)
-        self.fc_nei = nn.Linear(hidden_dim, hidden_dim)
-        self.fc_out = nn.Linear(hidden_dim, out_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, node_scalar: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        if node_scalar is None or node_scalar.numel() == 0:
-            device = edge_index.device if (edge_index is not None and torch.is_tensor(edge_index)) else torch.device("cpu")
-            return torch.zeros((self.fc_out.out_features,), device=device, dtype=torch.float32)
-
-        x = F.relu(self.fc_in(node_scalar))
-        x = self.dropout(x)
-        N = x.size(0)
-
-        if edge_index is None or edge_index.numel() == 0:
-            h = F.relu(self.fc_self(x))
-            return self.fc_out(h.mean(dim=0))
-
-        if edge_index.ndim == 2 and edge_index.size(0) != 2 and edge_index.size(1) == 2:
-            edge_index = edge_index.t().contiguous()
-
-        src, dst = edge_index[0], edge_index[1]  # (E,), (E,)
-        msg = x[src]                              # (E, hidden)
-
-        agg = torch.zeros_like(x)
-        agg.index_add_(0, dst, msg)
-
-        deg = torch.zeros((N, 1), device=x.device, dtype=x.dtype)
-        one = torch.ones((dst.numel(), 1), device=x.device, dtype=x.dtype)
-        deg.index_add_(0, dst, one)
-        agg = agg / deg.clamp_min(1.0)
-
-        h = F.relu(self.fc_self(x) + self.fc_nei(agg))
-        h = self.dropout(h)
-        return self.fc_out(h.mean(dim=0))
-
-
-class CrossAttnGate(nn.Module):
-    """
-    Cross-attention with a simple residual gate (no entropy / uncertainty terms).
-    """
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
-        super().__init__()
-        self.mha = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.ln1 = nn.LayerNorm(d_model)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(4 * d_model, d_model),
-            nn.Dropout(dropout),
-        )
-        self.gate = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, 1),
-            nn.Sigmoid(),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, q: torch.Tensor, kv: torch.Tensor, kv_mask: torch.Tensor) -> torch.Tensor:
-        # key_padding_mask: True => ignore
-        attn_out, _ = self.mha(
-            query=q,
-            key=kv,
-            value=kv,
-            key_padding_mask=~kv_mask,
-            need_weights=False,
+            nn.LayerNorm(out_dim),
         )
 
-        g = self.gate(torch.cat([q, attn_out], dim=-1))  # (B, Lq, 1)
-        x = q + self.dropout(attn_out) * g
-        x = self.ln1(x)
-        x = x + self.ffn(x)
-        x = self.ln2(x)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class EvidenceReliability(nn.Module):
+    """
+    Convert a feature vector to an evidential reliability score r in (0,1).
+
+    We use a tiny linear head to produce evidence for K=2 classes:
+      e = softplus(Wx + b) >= 0
+      alpha = e + 1
+      uncertainty u = K / sum(alpha)
+      reliability r = 1 - u
+    """
+    def __init__(self, in_dim: int, num_classes: int = 2) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.fc = nn.Linear(in_dim, num_classes)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # h: (B, d)
+        e = F.softplus(self.fc(h))  # (B, K)
+        alpha = e + 1.0
+        S = torch.sum(alpha, dim=-1, keepdim=True)  # (B,1)
+        u = float(self.num_classes) / (S + 1e-8)
+        r = 1.0 - u
+        # clamp to keep numerical stability
+        return torch.clamp(r, 0.0, 1.0)  # (B,1)
 
 
 class UGCABlock(nn.Module):
     """
-    One UGCA layer:
-      P <- D
-      D <- P
+    Uncertainty-Gated Collaborative Attention (UGCA) between:
+      drug tokens:  molclr, chemberta
+      protein tokens: esm2, pocket
+
+    Implementation is intentionally lightweight:
+    - single-head attention
+    - tokens are single vectors, so attention is across 2 tokens only
+    - gating uses reliability r_d * r_p and a small sigmoid gate
     """
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+
+    def __init__(self, d_model: int, dropout: float = 0.1) -> None:
         super().__init__()
-        self.p_from_d = CrossAttnGate(d_model, n_heads, dropout)
-        self.d_from_p = CrossAttnGate(d_model, n_heads, dropout)
+        self.d_model = d_model
 
-    def forward(self, P: torch.Tensor, Pm: torch.Tensor, D: torch.Tensor, Dm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        P2 = self.p_from_d(P, D, Dm)
-        D2 = self.d_from_p(D, P, Pm)
-        return P2, D2
+        # shared projection to keep parameters low
+        self.Wq = nn.Linear(d_model, d_model, bias=False)
+        self.Wk = nn.Linear(d_model, d_model, bias=False)
+        self.Wv = nn.Linear(d_model, d_model, bias=False)
 
+        self.gate = nn.Linear(2 * d_model, 1)
 
-@dataclass
-class SeqCfg:
-    # input dims
-    d_protein: int = 1280
-    d_molclr: int = 300
-    d_chem: int = 384
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
 
-    # model dims
-    d_model: int = 512
-    n_heads: int = 4
-    n_layers: int = 2
-    dropout: float = 0.1
+        # per-modality reliability heads (tiny)
+        self.rel_mc = EvidenceReliability(d_model)
+        self.rel_cb = EvidenceReliability(d_model)
+        self.rel_esm = EvidenceReliability(d_model)
+        self.rel_poc = EvidenceReliability(d_model)
 
-    # pocket
-    pocket_in_dim: int = 21
-    pocket_hidden: int = 128
+    def _attend(
+        self,
+        q_src: torch.Tensor,           # (B,d)
+        src_rel: torch.Tensor,         # (B,1)
+        kv_list: Tuple[torch.Tensor, torch.Tensor],  # list of (h, rel)
+    ) -> torch.Tensor:
+        # Build K,V tensors
+        hs = [h for (h, _) in kv_list]  # len=2, each (B,d)
+        rs = [r for (_, r) in kv_list]  # len=2, each (B,1)
 
+        K = torch.stack([self.Wk(h) for h in hs], dim=1)  # (B,2,d)
+        V = torch.stack([self.Wv(h) for h in hs], dim=1)  # (B,2,d)
 
-class UGCASeqPocketModel(nn.Module):
-    """
-    Sequence-only model (vec removed). Pocket is always used.
+        q = self.Wq(q_src).unsqueeze(1)  # (B,1,d)
+        logits = torch.sum(q * K, dim=-1) / math.sqrt(self.d_model)  # (B,2)
 
-    Forward inputs:
-      v_prot: (B, Mp, d_protein), m_prot: (B, Mp) bool
-      v_mol:  (B, Md, d_molclr),  m_mol:  (B, Md) bool
-      v_chem: (B, d_chem)
-      pocket_list: list[dict] length B, each with keys: node_scalar_feat, edge_index
-    """
-    def __init__(self, cfg: SeqCfg):
-        super().__init__()
-        self.cfg = cfg
-        d = cfg.d_model
+        # Gate each pair
+        gates = []
+        for h, r in zip(hs, rs):
+            g = torch.sigmoid(self.gate(torch.cat([q_src, h], dim=-1)))  # (B,1)
+            g = g * (src_rel * r)  # (B,1)
+            gates.append(g.squeeze(-1))  # (B,)
+        G = torch.stack(gates, dim=1)  # (B,2)
 
-        self.proj_p = nn.Linear(cfg.d_protein, d, bias=False)
-        self.proj_d = nn.Linear(cfg.d_molclr, d, bias=False)
-        self.proj_c = nn.Linear(cfg.d_chem, d, bias=False)
+        attn = torch.softmax(logits * G, dim=1)  # (B,2)
+        ctx = torch.sum(attn.unsqueeze(-1) * V, dim=1)  # (B,d)
 
-        self.pocket_enc = PocketGraphEncoder(
-            in_dim=cfg.pocket_in_dim,
-            hidden_dim=cfg.pocket_hidden,
-            out_dim=d,
-            dropout=cfg.dropout,
-        )
-
-        self.blocks = nn.ModuleList([UGCABlock(d, cfg.n_heads, cfg.dropout) for _ in range(cfg.n_layers)])
-
-        self.head = nn.Sequential(
-            nn.Linear(2 * d, d),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(d, 1),
-        )
-
-    def _graph_token(self, pocket_list: List[dict], device: torch.device) -> torch.Tensor:
-        g_list: List[torch.Tensor] = []
-        for pg in pocket_list:
-            if not isinstance(pg, dict):
-                g_list.append(torch.zeros((self.cfg.d_model,), device=device, dtype=torch.float32))
-                continue
-
-            node = pg.get("node_scalar_feat", None)
-            edge = pg.get("edge_index", None)
-
-            if node is None or edge is None:
-                g_list.append(torch.zeros((self.cfg.d_model,), device=device, dtype=torch.float32))
-                continue
-
-            node_t = node if torch.is_tensor(node) else torch.as_tensor(node, dtype=torch.float32, device=device)
-            edge_t = edge if torch.is_tensor(edge) else torch.as_tensor(edge, dtype=torch.long, device=device)
-
-            if node_t.numel() == 0:
-                g_list.append(torch.zeros((self.cfg.d_model,), device=device, dtype=torch.float32))
-                continue
-
-            g_list.append(self.pocket_enc(node_t.to(device=device, dtype=torch.float32),
-                                          edge_t.to(device=device, dtype=torch.long)))
-        return torch.stack(g_list, dim=0)  # (B,d)
+        out = self.norm(q_src + self.dropout(ctx))
+        return out
 
     def forward(
         self,
-        v_prot: torch.Tensor, m_prot: torch.Tensor,
-        v_mol: torch.Tensor,  m_mol: torch.Tensor,
-        v_chem: torch.Tensor,
-        pocket_list: List[dict],
-        topk_ratio: Optional[float] = None,  # kept for compatibility, unused
-    ) -> torch.Tensor:
-        _ = topk_ratio
-        device = v_prot.device
-        B = v_prot.size(0)
+        h_mc: torch.Tensor,
+        h_cb: torch.Tensor,
+        h_esm: torch.Tensor,
+        h_poc: torch.Tensor,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
+        # reliabilities
+        r_mc = self.rel_mc(h_mc)
+        r_cb = self.rel_cb(h_cb)
+        r_esm = self.rel_esm(h_esm)
+        r_poc = self.rel_poc(h_poc)
 
-        P = self.proj_p(v_prot)  # (B,Mp,d)
-        D = self.proj_d(v_mol)   # (B,Md,d)
-        Pm = m_prot
-        Dm = m_mol
+        # drug -> protein
+        h_mc2 = self._attend(h_mc, r_mc, ((h_esm, r_esm), (h_poc, r_poc)))
+        h_cb2 = self._attend(h_cb, r_cb, ((h_esm, r_esm), (h_poc, r_poc)))
 
-        # [CHEM] token -> prepend to drug
-        chem_tok = self.proj_c(v_chem).unsqueeze(1)  # (B,1,d)
-        D = torch.cat([chem_tok, D], dim=1)          # (B,Md+1,d)
-        Dm = torch.cat([torch.ones((B, 1), dtype=torch.bool, device=device), Dm], dim=1)
+        # protein -> drug
+        h_esm2 = self._attend(h_esm, r_esm, ((h_mc, r_mc), (h_cb, r_cb)))
+        h_poc2 = self._attend(h_poc, r_poc, ((h_mc, r_mc), (h_cb, r_cb)))
 
-        # [POCKET GRAPH] token -> prepend to protein (always)
-        graph_tok = self._graph_token(pocket_list, device=device).unsqueeze(1)  # (B,1,d)
-        P = torch.cat([graph_tok, P], dim=1)                                    # (B,Mp+1,d)
-        Pm = torch.cat([torch.ones((B, 1), dtype=torch.bool, device=device), Pm], dim=1)
-
-        for blk in self.blocks:
-            P, D = blk(P, Pm, D, Dm)
-
-        hP = masked_mean(P, Pm)
-        hD = masked_mean(D, Dm)
-        y = self.head(torch.cat([hP, hD], dim=-1)).squeeze(-1)  # (B,)
-        return y
+        rel = {"molclr": r_mc, "chemberta": r_cb, "esm2": r_esm, "pocket": r_poc}
+        return (h_mc2, h_cb2, h_esm2, h_poc2), rel
 
 
-def build_model(cfg: Dict[str, Any]) -> nn.Module:
+class UFiSHFusion(nn.Module):
     """
-    Build sequence+pocket model (pocket always enabled).
-    Keep backward compatibility for key names:
-      n_heads / nhead, n_layers / nlayers
-    """
-    n_heads = int(cfg.get("n_heads", cfg.get("nhead", 4)))
-    n_layers = int(cfg.get("n_layers", cfg.get("nlayers", 2)))
+    U-FiSH: Uncertainty-weighted Factorized Interaction & Sum Head
 
-    mcfg = SeqCfg(
-        d_protein=int(cfg.get("d_protein", 1280)),
-        d_molclr=int(cfg.get("d_molclr", 300)),
-        d_chem=int(cfg.get("d_chem", 384)),
-        d_model=int(cfg.get("d_model", 512)),
-        n_heads=n_heads,
-        n_layers=n_layers,
-        dropout=float(cfg.get("dropout", 0.1)),
-        pocket_in_dim=int(cfg.get("pocket_in_dim", 21)),
-        pocket_hidden=int(cfg.get("pocket_hidden", 128)),
-    )
-    return UGCASeqPocketModel(mcfg)
+    Inputs: 4 modality vectors h_i (B,d) and reliabilities r_i (B,1).
+    - weights w_i = softmax(r_i / tau)
+    - sum fusion: z_sum = Σ w_i h_i
+    - factorized interaction: z_int = Σ_{i<j} sqrt(w_i w_j) (h_i ⊙ h_j)
+    Output feature: concat(z_sum, z_int)  -> (B, 2d)
+    """
+    def __init__(self, d_model: int, tau: float = 1.0) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.tau = nn.Parameter(torch.tensor(float(tau)))
+
+    def forward(self, hs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], rs: torch.Tensor) -> torch.Tensor:
+        # hs: 4*(B,d)
+        # rs: (B,4,1) or (B,4)
+        if rs.dim() == 3:
+            rs = rs.squeeze(-1)
+        w = torch.softmax(rs / (self.tau.abs() + 1e-6), dim=1)  # (B,4)
+
+        h_stack = torch.stack(list(hs), dim=1)  # (B,4,d)
+        z_sum = torch.sum(w.unsqueeze(-1) * h_stack, dim=1)  # (B,d)
+
+        # factorized interactions (no extra params)
+        z_int = torch.zeros_like(z_sum)
+        for i in range(4):
+            for j in range(i + 1, 4):
+                wij = torch.sqrt(w[:, i] * w[:, j]).unsqueeze(-1)  # (B,1)
+                z_int = z_int + wij * (h_stack[:, i, :] * h_stack[:, j, :])
+        z = torch.cat([z_sum, z_int], dim=-1)  # (B,2d)
+        return z
+
+
+@dataclass
+class ModelConfig:
+    in_molclr: int
+    in_chemberta: int
+    in_esm2: int
+    in_pocket: int
+    d_model: int = 128
+    ugca_layers: int = 1
+    dropout: float = 0.1
+
+
+class UGCADTI(nn.Module):
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+        self.proj_molclr = MLPProjector(cfg.in_molclr, cfg.d_model, cfg.dropout)
+        self.proj_chemberta = MLPProjector(cfg.in_chemberta, cfg.d_model, cfg.dropout)
+        self.proj_esm2 = MLPProjector(cfg.in_esm2, cfg.d_model, cfg.dropout)
+        self.proj_pocket = MLPProjector(cfg.in_pocket, cfg.d_model, cfg.dropout)
+
+        self.ugca = nn.ModuleList([UGCABlock(cfg.d_model, dropout=cfg.dropout) for _ in range(cfg.ugca_layers)])
+        self.fusion = UFiSHFusion(cfg.d_model, tau=1.0)
+
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(2 * cfg.d_model),
+            nn.Linear(2 * cfg.d_model, cfg.d_model),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_model, 1),
+        )
+
+    def forward(
+        self,
+        molclr: torch.Tensor,
+        chemberta: torch.Tensor,
+        esm2: torch.Tensor,
+        pocket: torch.Tensor,
+        return_aux: bool = False,
+    ):
+        # project
+        h_mc = self.proj_molclr(molclr)
+        h_cb = self.proj_chemberta(chemberta)
+        h_esm = self.proj_esm2(esm2)
+        h_poc = self.proj_pocket(pocket)
+
+        # UGCA interaction
+        rel = None
+        for layer in self.ugca:
+            (h_mc, h_cb, h_esm, h_poc), rel = layer(h_mc, h_cb, h_esm, h_poc)
+
+        # fuse
+        # rel dict -> tensor (B,4)
+        rs = torch.cat([rel["molclr"], rel["chemberta"], rel["esm2"], rel["pocket"]], dim=1)  # (B,4)
+        z = self.fusion((h_mc, h_cb, h_esm, h_poc), rs)
+
+        logits = self.classifier(z)
+
+        if return_aux:
+            return logits, {"reliability": rs.detach()}
+        return logits

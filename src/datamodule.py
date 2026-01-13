@@ -1,420 +1,392 @@
-# src/datamodule.py
-# -*- coding: utf-8 -*-
+"""
+datamodule.py
+
+Lightweight data loading for UGCA-DTI:
+
+- reads `{dataset}.csv`
+- computes did/pid hash IDs
+- loads 4 offline encodings:
+    molclr/{did}.npy
+    chemberta/{did}.npy
+    esm2/{pid}.npz
+    pocket_graph/{pid}.npz
+
+Directory layout and naming rules follow your feature document.
+"""
+
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-import csv
-import hashlib
-import random
+from typing import Dict, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
+
+try:
+    from .splits import add_hash_ids, sanitize_label_series
+except ImportError:
+    try:
+        from src.splits import add_hash_ids, sanitize_label_series
+    except ImportError:
+        from splits import add_hash_ids, sanitize_label_series
 
 
-# ---------------- configs ----------------
-@dataclass
-class DMConfig:
-    train_data: Tuple[List[str], List[str], List[float]]
-    val_data:   Tuple[List[str], List[str], List[float]]
-    test_data:  Tuple[List[str], List[str], List[float]]
+# ----------------------------
+# Feature loading helpers
+# ----------------------------
 
-    batch_size: int = 64
-    num_workers: int = 4
-    pin_memory: bool = False
-    persistent_workers: bool = True
-    prefetch_factor: int = 2
-    drop_last: bool = False
+ESM2_KEY_PRIORITY = ("emb", "repr", "x", "feat")
 
 
-@dataclass
-class CacheDirs:
-    esm_dir: str
-    molclr_dir: str
-    chemberta_dir: str
-    pocket_dir: str
+def _np_to_float32(x: np.ndarray) -> np.ndarray:
+    if x.dtype == np.float16 or x.dtype == np.float32:
+        return x.astype(np.float32, copy=False)
+    return x.astype(np.float32)
 
 
-@dataclass
-class CacheDims:
-    esm2: int
-    molclr: int
-    chemberta: int
+def load_npy_vector(path: Path) -> np.ndarray:
+    """Load .npy feature and return a fixed-length vector.
 
-
-# ---------------- basic utils ----------------
-def _sha1_24(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:24]
-
-
-def _index_npz_dir(dir_path: Path) -> Dict[str, Path]:
-    tbl: Dict[str, Path] = {}
-    if not dir_path.exists():
-        return tbl
-    for p in dir_path.rglob("*.npz"):
-        tbl[p.stem] = p
-    return tbl
-
-
-def _npz_load(p: Path) -> Dict[str, np.ndarray]:
-    with np.load(str(p), allow_pickle=False) as z:
-        return {k: z[k] for k in z.files}
-
-
-def _npz_load_first_key(p: Optional[Path]) -> Optional[np.ndarray]:
-    if p is None or (not p.exists()):
-        return None
-    with np.load(str(p), allow_pickle=False) as z:
-        k = list(z.files)[0]
-        return z[k]
-
-
-def _as_2d(x: Optional[np.ndarray]) -> np.ndarray:
-    if x is None:
-        return np.zeros((0, 1), dtype=np.float32)
+    Some feature generators save token/atom-level matrices (L, d). To keep the
+    whole model lightweight and batchable, we apply mean pooling over the first
+    dimension whenever the loaded array is not 1-D.
+    """
+    x = np.load(str(path), allow_pickle=False)
     x = np.asarray(x)
-    if x.ndim == 1:
-        x = x[None, :]
-    return np.asarray(x, dtype=np.float32, order="C")
+
+    # If (L, d) or (..., d): pool over token/atom dimension(s)
+    if x.ndim >= 2:
+        # treat the last dim as feature dim
+        x = x.reshape(-1, x.shape[-1]).mean(axis=0)
+
+    if x.ndim != 1:
+        x = x.reshape(-1)
+    return _np_to_float32(x)
 
 
-def read_smiles_protein_label(path: str) -> Tuple[List[str], List[str], List[float]]:
+def load_esm2_vector(path: Path) -> np.ndarray:
+    npz = np.load(str(path), allow_pickle=False)
+    key = None
+    for k in ESM2_KEY_PRIORITY:
+        if k in npz.files:
+            key = k
+            break
+    if key is None:
+        if len(npz.files) == 0:
+            raise ValueError(f"Empty ESM2 npz: {path}")
+        key = npz.files[0]
+    x = npz[key]
+    x = np.asarray(x)
+    x = _np_to_float32(x)
+    if x.ndim == 2:
+        # (L, 1280) -> mean pool
+        x = x.mean(axis=0)
+    elif x.ndim != 1:
+        x = x.reshape(-1)
+    return x
+
+
+def pocket_npz_to_vector(path: Path, use_edge: bool = True) -> np.ndarray:
     """
-    Read CSV with columns:
-      smiles, protein, label
-    If header doesn't match, fallback to first 3 columns.
+    Convert pocket_graph GVP feature .npz to a single global vector.
+
+    Required keys (per your spec):
+      node_s: (N, ds)
+      node_v: (N, dv, 3)
+      edge_index: (2, E)
+      edge_s: (E, des)
+      edge_v: (E, dev, 3)
+      res_idx: (N,)
+
+    We keep it lightweight by using simple statistics pooling:
+      - node: mean(node_s) + mean(norm(node_v))
+      - edge: mean(edge_s) + mean(norm(edge_v)) (optional)
+
+    This avoids running a deep GVP-GNN while still using geometry signals.
     """
-    smiles, proteins, labels = [], [], []
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
+    npz = np.load(str(path), allow_pickle=False)
 
-        si = pi = li = 0
-        if header:
-            heads = [c.strip().lower() for c in header]
-            if all(x in heads for x in ("smiles", "protein", "label")):
-                si, pi, li = heads.index("smiles"), heads.index("protein"), heads.index("label")
-            else:
-                si, pi, li = 0, 1, 2
-                # header might be a data row
-                if len(header) >= 3:
-                    try:
-                        smiles.append(header[si]); proteins.append(header[pi]); labels.append(float(header[li]))
-                    except Exception:
-                        pass
+    # Node features
+    node_s = np.asarray(npz["node_s"])
+    node_v = np.asarray(npz["node_v"])
+    node_s = _np_to_float32(node_s)
+    node_v = _np_to_float32(node_v)
 
-        for row in reader:
-            if len(row) <= max(si, pi, li):
-                continue
-            try:
-                smiles.append(row[si])
-                proteins.append(row[pi])
-                labels.append(float(row[li]))
-            except Exception:
-                continue
-    return smiles, proteins, labels
+    if node_v.ndim != 3 or node_v.shape[-1] != 3:
+        raise ValueError(f"node_v must have shape (N, dv, 3). Got {node_v.shape} in {path}")
 
+    node_v_norm = np.linalg.norm(node_v, axis=-1)  # (N, dv)
+    node_feat = np.concatenate([node_s, node_v_norm], axis=-1)  # (N, ds+dv)
+    node_mean = node_feat.mean(axis=0)  # (ds+dv,)
 
-# backward compatible name used by older train.py
-_read_smiles_protein_label = read_smiles_protein_label
+    if not use_edge:
+        return _np_to_float32(node_mean)
 
+    # Edge features (optional)
+    edge_s = np.asarray(npz["edge_s"])
+    edge_v = np.asarray(npz["edge_v"])
+    edge_s = _np_to_float32(edge_s)
+    edge_v = _np_to_float32(edge_v)
+    if edge_v.ndim != 3 or edge_v.shape[-1] != 3:
+        raise ValueError(f"edge_v must have shape (E, dev, 3). Got {edge_v.shape} in {path}")
 
-_AMINO = set("ACDEFGHIKLMNPQRSTVWY")
-def _prot_variants(s: str) -> List[str]:
-    raw = s or ""
-    v = [raw, raw.strip(), "".join(raw.split()), "".join(raw.split()).upper()]
-    only_aa = "".join(ch for ch in raw if ch.upper() in _AMINO)
-    if only_aa:
-        v += [only_aa, only_aa.upper()]
-    out, seen = [], set()
-    for x in v:
-        if x not in seen:
-            seen.add(x); out.append(x)
-    return out
+    edge_v_norm = np.linalg.norm(edge_v, axis=-1)  # (E, dev)
+    edge_feat = np.concatenate([edge_s, edge_v_norm], axis=-1)  # (E, des+dev)
+    edge_mean = edge_feat.mean(axis=0)  # (des+dev,)
+
+    vec = np.concatenate([node_mean, edge_mean], axis=-1)
+    return _np_to_float32(vec)
 
 
-def _smiles_variants(s: str) -> List[str]:
-    raw = s or ""
-    v = [raw, raw.strip(), "".join(raw.split())]
-    out, seen = [], set()
-    for x in v:
-        if x not in seen:
-            seen.add(x); out.append(x)
-    return out
+# ----------------------------
+# Dataset
+# ----------------------------
 
-
-def _lookup(tbl: Dict[str, Path], keys: List[str]) -> Optional[Path]:
-    for k in keys:
-        p = tbl.get(_sha1_24(k))
-        if p is not None:
-            return p
-    return None
-
-
-# ---------------- pocket helpers ----------------
-def _factorize_to_int(arr: np.ndarray) -> np.ndarray:
-    flat = arr.reshape(-1)
-    mp: Dict[str, int] = {}
-    out = np.empty((flat.shape[0],), dtype=np.int64)
-    for i, x in enumerate(flat):
-        s = str(x)
-        if s not in mp:
-            mp[s] = len(mp)
-        out[i] = mp[s]
-    return out.reshape(arr.shape)
-
-
-def _pocket_to_tensors(npz: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
-    """
-    Convert pocket npz to a dict of tensors.
-    Keep only fields the model may need; skip strings except chain_id/res_idx (factorized).
-    """
-    keep = ["node_scalar_feat", "coords", "edge_index", "edge_scalar_feat", "res_idx", "chain_id"]
-    out: Dict[str, torch.Tensor] = {}
-
-    for k in keep:
-        if k not in npz:
-            continue
-
-        arr = np.asarray(npz[k])
-
-        # strings / objects
-        if arr.dtype.kind in ("U", "S", "O"):
-            if k in ("chain_id", "res_idx"):
-                arr_i = _factorize_to_int(arr)
-                out[k] = torch.as_tensor(arr_i, dtype=torch.long)
-            continue
-
-        if k in ("edge_index", "res_idx", "chain_id"):
-            out[k] = torch.as_tensor(arr.astype(np.int64, copy=False), dtype=torch.long)
-        else:
-            out[k] = torch.as_tensor(arr.astype(np.float32, copy=False), dtype=torch.float32)
-
-    # ensure always present
-    out.setdefault("node_scalar_feat", torch.zeros((0, 21), dtype=torch.float32))
-    out.setdefault("coords", torch.zeros((0, 3), dtype=torch.float32))
-    out.setdefault("edge_index", torch.zeros((2, 0), dtype=torch.long))
-    out.setdefault("edge_scalar_feat", torch.zeros((0, 1), dtype=torch.float32))
-    out.setdefault("res_idx", torch.zeros((0,), dtype=torch.long))
-    out.setdefault("chain_id", torch.zeros((0,), dtype=torch.long))
-    return out
-
-
-# ---------------- dataset ----------------
 class DTIDataset(Dataset):
-    """
-    Sequence-only (vec removed). Pocket is always used.
-
-    return per item:
-      (P_seq, D_seq, C_vec, pocket_dict, y)
-    """
     def __init__(
         self,
-        data: Tuple[List[str], List[str], List[float]],
-        esm_tbl: Dict[str, Path],
-        molclr_tbl: Dict[str, Path],
-        chem_tbl: Dict[str, Path],
-        pocket_tbl: Dict[str, Path],
-    ):
-        self.smiles, self.proteins, self.labels = data
-        self.esm_tbl = esm_tbl
-        self.molclr_tbl = molclr_tbl
-        self.chem_tbl = chem_tbl
-        self.pocket_tbl = pocket_tbl
+        df: pd.DataFrame,
+        feature_dirs: Dict[str, Path],
+        pocket_use_edge: bool = True,
+    ) -> None:
+        super().__init__()
+        self.df = df.reset_index(drop=True)
+        self.feature_dirs = feature_dirs
+        self.pocket_use_edge = pocket_use_edge
 
-        # small caches reduce IO
-        self._cache_esm: Dict[str, np.ndarray] = {}
-        self._cache_mol: Dict[str, np.ndarray] = {}
-        self._cache_chem: Dict[str, np.ndarray] = {}
-        self._cache_pocket: Dict[str, Dict[str, torch.Tensor]] = {}
+    def __len__(self) -> int:
+        return len(self.df)
 
-    def __len__(self):
-        return len(self.labels)
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        row = self.df.iloc[idx]
+        did = row["did"]
+        pid = row["pid"]
 
-    def _seq_cached(self, p: Optional[Path], cache: dict) -> np.ndarray:
-        if p is None:
-            return np.zeros((0, 1), dtype=np.float32)
-        k = str(p)
-        v = cache.get(k)
-        if v is None:
-            v = _as_2d(_npz_load_first_key(p))
-            cache[k] = v
-        return v
+        molclr = load_npy_vector(self.feature_dirs["molclr"] / f"{did}.npy")
+        chemberta = load_npy_vector(self.feature_dirs["chemberta"] / f"{did}.npy")
+        esm2 = load_esm2_vector(self.feature_dirs["esm2"] / f"{pid}.npz")
+        pocket = pocket_npz_to_vector(self.feature_dirs["pocket_graph"] / f"{pid}.npz", use_edge=self.pocket_use_edge)
 
-    def _pocket_cached(self, p: Optional[Path]) -> Dict[str, torch.Tensor]:
-        if p is None:
-            return _pocket_to_tensors({})
-        k = str(p)
-        d = self._cache_pocket.get(k)
-        if d is None:
-            d = _pocket_to_tensors(_npz_load(p))
-            self._cache_pocket[k] = d
-        return d
+        y = float(row["label"])
 
-    def __getitem__(self, idx: int):
-        smi = self.smiles[idx]
-        pro = self.proteins[idx]
-        y = float(self.labels[idx])
-
-        p_path = _lookup(self.esm_tbl, _prot_variants(pro))
-        d1_path = _lookup(self.molclr_tbl, _smiles_variants(smi))
-        c_path = _lookup(self.chem_tbl, _smiles_variants(smi))
-        pk_path = _lookup(self.pocket_tbl, _prot_variants(pro))
-
-        P = self._seq_cached(p_path, self._cache_esm)
-        D = self._seq_cached(d1_path, self._cache_mol)
-        C = self._seq_cached(c_path, self._cache_chem)
-        if C.ndim == 2:
-            C = C.mean(axis=0)  # (d_chem,)
-
-        pocket = self._pocket_cached(pk_path)
-        return P, D, C.astype(np.float32, copy=True), pocket, np.float32(y)
-
-
-# ---------------- collate ----------------
-def _pad_and_mask(batch_list: List[np.ndarray]) -> Tuple[torch.Tensor, torch.Tensor]:
-    lens = [x.shape[0] for x in batch_list]
-    d = max([x.shape[1] for x in batch_list] + [1])
-    tmax = max(lens + [1])
-    B = len(batch_list)
-    out = np.zeros((B, tmax, d), dtype=np.float32)
-    mask = np.zeros((B, tmax), dtype=bool)
-    for i, x in enumerate(batch_list):
-        L = x.shape[0]
-        out[i, :L, :x.shape[1]] = x
-        mask[i, :L] = True
-    return torch.tensor(out, dtype=torch.float32), torch.tensor(mask, dtype=torch.bool)
-
-
-def collate_fn(batch):
-    # (P, D, C, pocket, y)
-    P_list = [x[0] for x in batch]
-    D_list = [x[1] for x in batch]
-    C_list = [x[2] for x in batch]
-    pocket_list = [x[3] for x in batch]
-    y_list = [x[4] for x in batch]
-
-    P, Pm = _pad_and_mask(P_list)
-    D, Dm = _pad_and_mask(D_list)
-    C = torch.tensor(np.stack(C_list, axis=0), dtype=torch.float32)
-    y = torch.tensor(np.asarray(y_list, dtype=np.float32), dtype=torch.float32)
-    return P, Pm, D, Dm, C, pocket_list, y
-
-
-# ---------------- datamodule ----------------
-class DataModule:
-    def __init__(self, cfg: DMConfig, cache_dirs: CacheDirs, verbose: bool = False):
-        self.cfg = cfg
-        self.verbose = verbose
-
-        # esm/esm2 fallback
-        cand = [Path(cache_dirs.esm_dir)]
-        if "/esm2/" in cache_dirs.esm_dir:
-            cand.append(Path(cache_dirs.esm_dir.replace("/esm2/", "/esm/")))
-        elif "/esm/" in cache_dirs.esm_dir:
-            cand.append(Path(cache_dirs.esm_dir.replace("/esm/", "/esm2/")))
-
-        picked = None
-        esm_tbl = {}
-        for c in cand:
-            tbl = _index_npz_dir(c)
-            if tbl:
-                picked, esm_tbl = c, tbl
-                break
-        if picked is None:
-            picked = cand[0]
-            esm_tbl = _index_npz_dir(picked)
-
-        self.esm_dir_used = str(picked)
-        self.esm_tbl = esm_tbl
-        self.molclr_tbl = _index_npz_dir(Path(cache_dirs.molclr_dir))
-        self.chem_tbl = _index_npz_dir(Path(cache_dirs.chemberta_dir))
-        self.pocket_tbl = _index_npz_dir(Path(cache_dirs.pocket_dir))
-
-        self._summary = self._build_summary()
-
-    def _hit_rate(self, data: Tuple[List[str], List[str], List[float]], sample_cap: int = 2000) -> str:
-        smi, pro, _ = data
-        n = len(smi)
-        if n == 0:
-            return "NA"
-        idxs = list(range(n))
-        if n > sample_cap:
-            random.seed(42)
-            idxs = random.sample(idxs, sample_cap)
-
-        hit_all = 0
-        for i in idxs:
-            p = _lookup(self.esm_tbl, _prot_variants(pro[i]))
-            d = _lookup(self.molclr_tbl, _smiles_variants(smi[i]))
-            c = _lookup(self.chem_tbl, _smiles_variants(smi[i]))
-            pk = _lookup(self.pocket_tbl, _prot_variants(pro[i]))
-            ok = (p is not None) and (d is not None) and (c is not None) and (pk is not None)
-            hit_all += int(ok)
-
-        return f"{hit_all/len(idxs)*100:.1f}%"
-
-    def _uniq_counts(self, data: Tuple[List[str], List[str], List[float]]) -> Tuple[int, int]:
-        smi, pro, _ = data
-        return len(set(smi)), len(set(pro))
-
-    def _build_summary(self) -> Dict[str, Any]:
         return {
-            "esm_dir_used": self.esm_dir_used,
-            "index_size": {
-                "esm": len(self.esm_tbl),
-                "molclr": len(self.molclr_tbl),
-                "chemberta": len(self.chem_tbl),
-                "pocket": len(self.pocket_tbl),
-            },
-            "hit_rate": {
-                "train": self._hit_rate(self.cfg.train_data),
-                "val": self._hit_rate(self.cfg.val_data),
-                "test": self._hit_rate(self.cfg.test_data),
-            },
-            "uniq": {
-                "train": self._uniq_counts(self.cfg.train_data),
-                "val": self._uniq_counts(self.cfg.val_data),
-                "test": self._uniq_counts(self.cfg.test_data),
-            },
+            "molclr": torch.from_numpy(molclr),
+            "chemberta": torch.from_numpy(chemberta),
+            "esm2": torch.from_numpy(esm2),
+            "pocket": torch.from_numpy(pocket),
+            "label": torch.tensor(y, dtype=torch.float32),
         }
 
-    def summary(self) -> Dict[str, Any]:
-        return self._summary
 
-    def _make_loader(self, data, shuffle: bool) -> DataLoader:
-        ds = DTIDataset(
-            data=data,
-            esm_tbl=self.esm_tbl,
-            molclr_tbl=self.molclr_tbl,
-            chem_tbl=self.chem_tbl,
-            pocket_tbl=self.pocket_tbl,
+def dti_collate_fn(batch):
+    # batch: list[dict]
+    out = {}
+    keys = batch[0].keys()
+    for k in keys:
+        if k == "label":
+            out[k] = torch.stack([b[k] for b in batch], dim=0).view(-1, 1)
+        else:
+            shapes = [tuple(b[k].shape) for b in batch]
+            if len(set(shapes)) != 1:
+                raise RuntimeError(f"Collate shape mismatch for '{k}': {shapes}. "
+                                   "This usually means the stored feature is token/atom-level without pooling.")
+            out[k] = torch.stack([b[k] for b in batch], dim=0)
+    return out
+
+
+# ----------------------------
+# DataModule
+# ----------------------------
+
+@dataclass
+class DataPaths:
+    dataset: str
+    root_dir: Path = Path("/root/lanyun-fs")
+
+    @property
+    def dataset_dir(self) -> Path:
+        return self.root_dir / self.dataset.lower()
+
+    @property
+    def csv_path(self) -> Path:
+        return self.dataset_dir / f"{self.dataset.lower()}.csv"
+
+    @property
+    def feature_dirs(self) -> Dict[str, Path]:
+        return {
+            "molclr": self.dataset_dir / "molclr",
+            "chemberta": self.dataset_dir / "chemberta",
+            "esm2": self.dataset_dir / "esm2",
+            "pocket_graph": self.dataset_dir / "pocket_graph",
+        }
+
+
+class DTIDataModule:
+    def __init__(
+        self,
+        dataset: str,
+        train_idx,
+        val_idx,
+        test_idx,
+        batch_size: int = 256,
+        num_workers: int = 4,
+        allow_missing: bool = False,
+        pocket_use_edge: bool = True,
+        root_dir: str = "/root/lanyun-fs",
+    ) -> None:
+        self.dataset = dataset
+        self.paths = DataPaths(dataset=dataset, root_dir=Path(root_dir))
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.allow_missing = allow_missing
+        self.pocket_use_edge = pocket_use_edge
+
+        self.train_idx = np.asarray(train_idx, dtype=int)
+        self.val_idx = np.asarray(val_idx, dtype=int)
+        self.test_idx = np.asarray(test_idx, dtype=int)
+
+        self.df_all: Optional[pd.DataFrame] = None
+        self.df_train: Optional[pd.DataFrame] = None
+        self.df_val: Optional[pd.DataFrame] = None
+        self.df_test: Optional[pd.DataFrame] = None
+
+        self._id_sets = {}
+
+        self.input_dims: Optional[Dict[str, int]] = None
+
+    def load_dataframe(self) -> pd.DataFrame:
+        if not self.paths.csv_path.exists():
+            raise FileNotFoundError(f"CSV not found: {self.paths.csv_path}")
+        df = pd.read_csv(self.paths.csv_path)
+        if "label" not in df.columns:
+            raise ValueError("CSV must contain a 'label' column for classification.")
+        df = add_hash_ids(df)
+        df["label"] = sanitize_label_series(df["label"])
+        return df
+
+    def _build_feature_id_sets(self) -> None:
+        """Scan feature directories to build {modality: set(ids)} for fast hit-check."""
+        dirs = self.paths.feature_dirs
+        id_sets = {}
+        for mod, d in dirs.items():
+            if not d.exists():
+                raise FileNotFoundError(f"Feature directory not found: {d}")
+            if mod in ("molclr", "chemberta"):
+                exts = (".npy",)
+            else:
+                exts = (".npz",)
+            ids = set()
+            for fn in os.listdir(d):
+                if fn.endswith(exts):
+                    ids.add(Path(fn).stem)
+            id_sets[mod] = ids
+        self._id_sets = id_sets
+
+    def _feature_hit_stats(self, df_split: pd.DataFrame) -> Dict[str, int]:
+        """Return missing counts for each modality in this split (pair-level)."""
+        miss = {}
+        dids = df_split["did"].astype(str)
+        pids = df_split["pid"].astype(str)
+
+        miss["molclr"] = int((~dids.isin(self._id_sets["molclr"])).sum())
+        miss["chemberta"] = int((~dids.isin(self._id_sets["chemberta"])).sum())
+        miss["esm2"] = int((~pids.isin(self._id_sets["esm2"])).sum())
+        miss["pocket_graph"] = int((~pids.isin(self._id_sets["pocket_graph"])).sum())
+        return miss
+
+    def _filter_valid_pairs(self, df_split: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int], int]:
+        """Filter out rows where any modality feature file is missing."""
+        dids = df_split["did"].astype(str)
+        pids = df_split["pid"].astype(str)
+        ok = (
+            dids.isin(self._id_sets["molclr"])
+            & dids.isin(self._id_sets["chemberta"])
+            & pids.isin(self._id_sets["esm2"])
+            & pids.isin(self._id_sets["pocket_graph"])
         )
+        miss = self._feature_hit_stats(df_split)
+        dropped = int((~ok).sum())
+        return df_split[ok].reset_index(drop=True), miss, dropped
 
-        kwargs = dict(
-            dataset=ds,
-            batch_size=self.cfg.batch_size,
+    def setup(self, verbose: bool = True) -> None:
+        self.df_all = self.load_dataframe()
+        if len(self.df_all) == 0:
+            raise ValueError("Empty dataset CSV.")
+
+        self._build_feature_id_sets()
+
+        df_train = self.df_all.iloc[self.train_idx].copy()
+        df_val = self.df_all.iloc[self.val_idx].copy()
+        df_test = self.df_all.iloc[self.test_idx].copy()
+
+        # Check / filter missing features
+        df_train_f, miss_train, drop_train = self._filter_valid_pairs(df_train)
+        df_val_f, miss_val, drop_val = self._filter_valid_pairs(df_val)
+        df_test_f, miss_test, drop_test = self._filter_valid_pairs(df_test)
+
+
+        if verbose:
+            total_pairs = len(df_train) + len(df_val) + len(df_test)
+            after_pairs = len(df_train_f) + len(df_val_f) + len(df_test_f)
+
+            # overall (pair-level) hit rates
+            miss_total = {
+                "molclr": miss_train["molclr"] + miss_val["molclr"] + miss_test["molclr"],
+                "chemberta": miss_train["chemberta"] + miss_val["chemberta"] + miss_test["chemberta"],
+                "esm2": miss_train["esm2"] + miss_val["esm2"] + miss_test["esm2"],
+                "pocket_graph": miss_train["pocket_graph"] + miss_val["pocket_graph"] + miss_test["pocket_graph"],
+            }
+            # pairs missing ANY modality
+            dropped_total = drop_train + drop_val + drop_test
+
+            def _rate(miss_cnt: int) -> float:
+                return 0.0 if total_pairs == 0 else (1.0 - miss_cnt / total_pairs) * 100.0
+
+            print(f"Split sizes (pairs): train={len(df_train)}, val={len(df_val)}, test={len(df_test)}")
+            print(f"Feature hit-rate (overall): "
+                  f"molclr={_rate(miss_total['molclr']):.2f}%, "
+                  f"chemberta={_rate(miss_total['chemberta']):.2f}%, "
+                  f"esm2={_rate(miss_total['esm2']):.2f}%, "
+                  f"pocket={_rate(miss_total['pocket_graph']):.2f}%  "
+                  f"(dropped_any={dropped_total}/{total_pairs})")
+            print(f"All four encodings hit for this fold?  {dropped_total == 0}")
+
+        if (drop_train + drop_val + drop_test) > 0 and not self.allow_missing:
+            raise RuntimeError(
+                "Some feature files are missing. "
+                "Re-run with --allow_missing to drop those pairs, or fix the feature directories."
+            )
+
+        self.df_train, self.df_val, self.df_test = df_train_f, df_val_f, df_test_f
+
+        # Infer input dims from one training example
+        if len(self.df_train) == 0:
+            raise RuntimeError("No training pairs left after feature checking.")
+        sample = DTIDataset(self.df_train.iloc[:1], self.paths.feature_dirs, pocket_use_edge=self.pocket_use_edge)[0]
+        self.input_dims = {
+            "molclr": int(sample["molclr"].numel()),
+            "chemberta": int(sample["chemberta"].numel()),
+            "esm2": int(sample["esm2"].numel()),
+            "pocket": int(sample["pocket"].numel()),
+        }
+
+    def get_dataloader(self, split: str, shuffle: bool = False) -> DataLoader:
+        if split not in ("train", "val", "test"):
+            raise ValueError("split must be in {'train','val','test'}")
+        if self.df_train is None:
+            raise RuntimeError("Call setup() first.")
+        df = {"train": self.df_train, "val": self.df_val, "test": self.df_test}[split]
+        dataset = DTIDataset(df, self.paths.feature_dirs, pocket_use_edge=self.pocket_use_edge)
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
             shuffle=shuffle,
-            num_workers=self.cfg.num_workers,
-            pin_memory=self.cfg.pin_memory,
-            drop_last=(self.cfg.drop_last if shuffle else False),
-            collate_fn=collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            collate_fn=dti_collate_fn,
+            drop_last=False,
         )
-
-        # DataLoader: num_workers=0 cannot use persistent_workers/prefetch_factor
-        if self.cfg.num_workers > 0:
-            kwargs["persistent_workers"] = bool(self.cfg.persistent_workers)
-            kwargs["prefetch_factor"] = int(self.cfg.prefetch_factor)
-
-        return DataLoader(**kwargs)
-
-    def train_loader(self) -> DataLoader:
-        return self._make_loader(self.cfg.train_data, shuffle=True)
-
-    def val_loader(self) -> DataLoader:
-        return self._make_loader(self.cfg.val_data, shuffle=False)
-
-    def test_loader(self) -> DataLoader:
-        return self._make_loader(self.cfg.test_data, shuffle=False)

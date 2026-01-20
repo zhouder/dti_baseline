@@ -6,8 +6,11 @@ import h5py
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data, Batch
 
+# [移除 RDKit 引用，防止报错]
+# from rdkit import Chem 
+
 class DTIDataset(Dataset):
-    def __init__(self, df, root_dir, dataset_name, cache=False):
+    def __init__(self, df, root_dir, dataset_name, cache=False, verbose=False):
         self.df = df.reset_index(drop=True)
         self.root_dir = root_dir
         self.dataset_name = dataset_name
@@ -16,10 +19,13 @@ class DTIDataset(Dataset):
         self.h5_path = os.path.join(base, f"{dataset_name}_data.h5")
         self.use_h5 = os.path.exists(self.h5_path)
         
-        if self.use_h5:
-            print(f"Using HDF5: {self.h5_path}")
-        else:
-            print(f"WARNING: HDF5 not found at {self.h5_path}. Falling back to slow files.")
+        if verbose:
+            if self.use_h5:
+                print(f">>> Data Source: HDF5 ({self.h5_path})")
+            else:
+                print(f">>> Data Source: Raw Files (Slow) at {base}")
+
+        if not self.use_h5:
             self.paths = {
                 'molclr': os.path.join(base, 'molclr'),
                 'chemberta': os.path.join(base, 'chemberta'),
@@ -59,7 +65,6 @@ class DTIDataset(Dataset):
         return molclr, chemberta, esm2, graph
 
     def _get_from_files(self, did, pid):
-        # Fallback implementation (Simplified)
         try:
             m = np.load(os.path.join(self.paths['molclr'], f"{did}.npy"))
             if m.ndim == 2: m = np.mean(m, axis=0)
@@ -111,6 +116,11 @@ class DTIDataset(Dataset):
             'molclr': molclr, 'chemberta': chemberta, 'esm2': esm2, 'graph': graph,
             'label': torch.tensor(label, dtype=torch.float)
         }
+    
+    def __del__(self):
+        if self.h5_file is not None:
+            try: self.h5_file.close()
+            except: pass
 
 def collate_fn(batch):
     return {
@@ -121,7 +131,6 @@ def collate_fn(batch):
         'label': torch.stack([b['label'] for b in batch])
     }
 
-def get_dataloader(df, root_dir, dataset_name, batch_size=32, shuffle=True, num_workers=8, cache=False):
-    ds = DTIDataset(df, root_dir, dataset_name)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, 
+def get_dataloader(dataset, batch_size=32, shuffle=True, num_workers=8):
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, 
                       collate_fn=collate_fn, pin_memory=True, persistent_workers=True)

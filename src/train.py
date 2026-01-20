@@ -8,7 +8,15 @@ import time
 import random
 import h5py
 from tqdm import tqdm
-from sklearn.metrics import average_precision_score, roc_auc_score, f1_score
+from sklearn.metrics import (
+    average_precision_score, 
+    roc_auc_score, 
+    f1_score,
+    accuracy_score,
+    recall_score,
+    matthews_corrcoef,
+    confusion_matrix
+)
 from torch.utils.data import Subset
 
 from src.splits import generate_ids, get_kfold_indices
@@ -24,13 +32,36 @@ def seed_everything(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def compute_metrics(y_true, y_probs):
-    y_pred = (y_probs > 0.5).astype(int)
-    if len(np.unique(y_true)) < 2: return {'AUPRC': 0.0, 'AUROC': 0.0, 'F1': 0.0}
+def compute_metrics(y_true, y_probs, threshold=0.5):
+    y_pred = (y_probs > threshold).astype(int)
+    
+    # 防止单一类别报错
+    if len(np.unique(y_true)) < 2: 
+        return {
+            'AUPRC': 0.0, 'AUROC': 0.0, 'F1': 0.0, 
+            'ACC': 0.0, 'SEN': 0.0, 'MCC': 0.0
+        }
+    
+    # 基础指标
+    auprc = average_precision_score(y_true, y_probs)
+    auroc = roc_auc_score(y_true, y_probs)
+    f1 = f1_score(y_true, y_pred)
+    acc = accuracy_score(y_true, y_pred)
+    
+    # 敏感度 (Sensitivity) / 召回率 (Recall)
+    # SEN = TP / (TP + FN)
+    sen = recall_score(y_true, y_pred)
+    
+    # MCC
+    mcc = matthews_corrcoef(y_true, y_pred)
+    
     return {
-        'AUPRC': average_precision_score(y_true, y_probs),
-        'AUROC': roc_auc_score(y_true, y_probs),
-        'F1': f1_score(y_true, y_pred)
+        'AUPRC': auprc,
+        'AUROC': auroc,
+        'F1': f1,
+        'ACC': acc,
+        'SEN': sen,
+        'MCC': mcc
     }
 
 def run_epoch(model, loader, criterion, optimizer, device, is_train=True):
@@ -104,7 +135,7 @@ def main():
     
     # Model Params
     parser.add_argument('--dim', type=int, default=256)
-    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.2)
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--factor', type=float, default=0.8)
@@ -188,7 +219,9 @@ def main():
 
         log_file = os.path.join(fold_dir, 'log.csv')
         if not os.path.exists(log_file):
-            with open(log_file, 'w') as f: f.write("Epoch,TrainLoss,ValLoss,AUPRC,AUROC,F1,Time\n")
+            with open(log_file, 'w') as f: 
+                # [Change] Added ACC, SEN, MCC to header
+                f.write("Epoch,TrainLoss,ValLoss,AUPRC,AUROC,F1,ACC,SEN,MCC,Time\n")
             
         for epoch in range(start_epoch, args.epochs):
             t0 = time.time()
@@ -207,10 +240,16 @@ def main():
                 patience_counter += 1
             
             status = "*" if improved else ""
-            print(f"Ep {epoch+1:03d} | AUPRC: {val_met['AUPRC']:.4f} | AUROC: {val_met['AUROC']:.4f} | F1: {val_met['F1']:.4f} | Time: {dur:.1f}s | Pat: {patience_counter} {status}")
+            # [Change] Added ACC, SEN, MCC to print
+            print(f"Ep {epoch+1:03d} | AUPRC: {val_met['AUPRC']:.4f} | AUROC: {val_met['AUROC']:.4f} | "
+                  f"F1: {val_met['F1']:.4f} | ACC: {val_met['ACC']:.4f} | SEN: {val_met['SEN']:.4f} | "
+                  f"MCC: {val_met['MCC']:.4f} | Time: {dur:.1f}s | Pat: {patience_counter} {status}")
             
             with open(log_file, 'a') as f:
-                f.write(f"{epoch+1},{train_met['Loss']:.5f},{val_met['Loss']:.5f},{val_met['AUPRC']:.5f},{val_met['AUROC']:.5f},{val_met['F1']:.5f},{dur:.1f}\n")
+                # [Change] Added ACC, SEN, MCC to log file
+                f.write(f"{epoch+1},{train_met['Loss']:.5f},{val_met['Loss']:.5f},"
+                        f"{val_met['AUPRC']:.5f},{val_met['AUROC']:.5f},{val_met['F1']:.5f},"
+                        f"{val_met['ACC']:.5f},{val_met['SEN']:.5f},{val_met['MCC']:.5f},{dur:.1f}\n")
             
             torch.save({
                 'epoch': epoch, 'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 
@@ -225,7 +264,9 @@ def main():
             test_met = run_epoch(model, test_loader, criterion, optimizer, device, False)
             pd.DataFrame([test_met]).to_csv(result_csv, index=False)
             results.append(test_met)
-            print(f"Fold {fold_id} Test AUPRC: {test_met['AUPRC']:.4f}")
+            # [Change] Added ACC, SEN, MCC to final fold print
+            print(f"Fold {fold_id} Test Results: AUPRC={test_met['AUPRC']:.4f}, AUROC={test_met['AUROC']:.4f}, "
+                  f"F1={test_met['F1']:.4f}, ACC={test_met['ACC']:.4f}, SEN={test_met['SEN']:.4f}, MCC={test_met['MCC']:.4f}")
 
     if results:
         pd.DataFrame(results).describe().loc[['mean', 'std']].to_csv(os.path.join(exp_name, 'summary.csv'))

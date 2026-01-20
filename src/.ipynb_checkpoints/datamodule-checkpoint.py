@@ -6,12 +6,15 @@ import h5py
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data, Batch
 
-# [移除 RDKit 引用，防止报错]
-# from rdkit import Chem 
+# -----------------------------------------------------------
+# [修复] 移除 rdkit 导入，彻底解决 _ARRAY_API 报错
+# -----------------------------------------------------------
 
 class DTIDataset(Dataset):
     def __init__(self, df, root_dir, dataset_name, cache=False, verbose=False):
+        # 直接使用传入的已处理 dataframe
         self.df = df.reset_index(drop=True)
+        
         self.root_dir = root_dir
         self.dataset_name = dataset_name
         

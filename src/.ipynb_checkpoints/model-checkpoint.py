@@ -28,14 +28,11 @@ class SimpleGVPConv(MessagePassing):
 
 class PocketGraphProcessor(nn.Module):
     """Encodes PocketGraph into a vector"""
-    def __init__(self, out_dim=256):
+    def __init__(self, out_dim=256, dropout=0.1):
         super().__init__()
-        # [关键修复] 设置为正确的默认维度，避免Resume报错
-        # s: 21(AA) + 1(pLDDT) + 1(RelPos) = 23
+        # Dimensions must match src/encode/encode_pocket_gvp.py
         self.s_emb = nn.Linear(23, out_dim) 
-        # v: 4 vectors -> 16 channels
         self.v_emb = nn.Linear(4, 16)       
-        # e: 16(RBF) + 1(SeqSep) = 17
         self.e_emb = nn.Linear(17, out_dim)  
         
         self.conv = SimpleGVPConv(out_dim, 16)
@@ -43,23 +40,22 @@ class PocketGraphProcessor(nn.Module):
             nn.Linear(out_dim + 16, out_dim),
             nn.LayerNorm(out_dim),
             nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.Dropout(dropout) # Configurable dropout
         )
 
     def forward(self, data):
         s, v, edge_index, edge_s = data.node_s, data.node_v, data.edge_index, data.edge_s
         
-        # 动态适配 (保险起见保留，但默认值已修正)
+        # Safety check for dimensions
         if s.shape[1] != self.s_emb.in_features: 
-            self.s_emb = nn.Linear(s.shape[1], 256).to(s.device)
-        if v.shape[1] != self.v_emb.in_features: 
-            self.v_emb = nn.Linear(v.shape[1], 16).to(v.device)
+            self.s_emb = nn.Linear(s.shape[1], self.s_emb.out_features).to(s.device)
+        if v.shape[1] != self.v_emb.in_features:
+            self.v_emb = nn.Linear(v.shape[1], self.v_emb.out_features).to(v.device)
         if edge_s.shape[1] != self.e_emb.in_features: 
-            self.e_emb = nn.Linear(edge_s.shape[1], 256).to(edge_s.device)
+            self.e_emb = nn.Linear(edge_s.shape[1], self.e_emb.out_features).to(edge_s.device)
 
         s = self.s_emb(s)
         edge_s = self.e_emb(edge_s)
-        # v: (N, 4, 3) -> (N, 3, 4) -> Linear -> (N, 3, 16) -> (N, 16, 3)
         v = self.v_emb(v.transpose(1,2)).transpose(1,2)
         
         s = self.conv(s, v, edge_index, edge_s)
@@ -71,10 +67,10 @@ class PocketGraphProcessor(nn.Module):
         return self.out(graph_vec)
 
 # ==========================================
-# 2. Distributional UGCA (Uncertainty Core)
+# 2. Robust UGCA (MLP Gating)
 # ==========================================
-class DistributionalUGCA(nn.Module):
-    def __init__(self, dim, num_heads=4):
+class RobustUGCA(nn.Module):
+    def __init__(self, dim, num_heads=4, dropout=0.1):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -86,29 +82,21 @@ class DistributionalUGCA(nn.Module):
         self.v = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
         
-        # Uncertainty Estimator (Log-Variance)
-        self.log_var_estimator = nn.Sequential(
+        self.gate_net = nn.Sequential(
             nn.Linear(dim, dim // 2),
             nn.ReLU(),
-            nn.Linear(dim // 2, 1) 
+            nn.Linear(dim // 2, 1),
+            nn.Sigmoid() 
         )
         
         self.norm1 = nn.LayerNorm(dim)
-        self.dropout = nn.Dropout(0.3) 
+        self.dropout = nn.Dropout(dropout) # Configurable dropout
 
     def forward(self, x_q, x_kv):
         B, D = x_q.shape
+        u = self.gate_net(x_q) 
+        gate = 1.0 - u
         
-        # 1. Uncertainty Estimation
-        log_var = self.log_var_estimator(x_q)
-        # [关键修复] 增加数值稳定性 Clamp
-        log_var = torch.clamp(log_var, min=-5.0, max=5.0)
-        variance = F.softplus(log_var) 
-        
-        # 2. Gating
-        gate = 1.0 / (1.0 + variance)
-        
-        # 3. Cross-Attention
         q = self.q(x_q).reshape(B, 1, self.num_heads, self.head_dim).permute(0,2,1,3)
         k = self.k(x_kv).reshape(B, 1, self.num_heads, self.head_dim).permute(0,2,1,3)
         v = self.v(x_kv).reshape(B, 1, self.num_heads, self.head_dim).permute(0,2,1,3)
@@ -119,49 +107,48 @@ class DistributionalUGCA(nn.Module):
         out = (attn @ v).transpose(1,2).reshape(B, D)
         out = self.out_proj(out)
         
-        # 4. Gated Residual
         fused = x_q + self.dropout(out * gate)
         return self.norm1(fused)
 
 # ==========================================
-# 3. Main Model
+# 3. Main Model Architecture
 # ==========================================
 class UGCADTI(nn.Module):
-    def __init__(self):
+    def __init__(self, dim=256, dropout=0.1, num_heads=4):
         super().__init__()
-        self.dim = 256
+        self.dim = dim
         molclr_dim = 300 
         
-        # Encoders
+        # Encoders with configurable dropout
         self.molclr_proj = nn.Sequential(
             nn.Linear(molclr_dim, self.dim),
             nn.LayerNorm(self.dim),
             nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.Dropout(dropout)
         )
         self.chemberta_proj = nn.Sequential(
             nn.Linear(384, self.dim),
             nn.LayerNorm(self.dim),
             nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.Dropout(dropout)
         )
         self.esm2_proj = nn.Sequential(
             nn.Linear(1280, self.dim),
             nn.LayerNorm(self.dim),
             nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.Dropout(dropout)
         )
-        self.pocket_proc = PocketGraphProcessor(out_dim=self.dim)
+        self.pocket_proc = PocketGraphProcessor(out_dim=self.dim, dropout=dropout)
         
         # Interaction (UGCA)
-        self.ugca_drug = DistributionalUGCA(self.dim)
-        self.ugca_prot = DistributionalUGCA(self.dim)
+        self.ugca_drug = RobustUGCA(self.dim, num_heads=num_heads, dropout=dropout)
+        self.ugca_prot = RobustUGCA(self.dim, num_heads=num_heads, dropout=dropout)
         
         # Prediction Head
         self.fusion = nn.Sequential(
             nn.Linear(self.dim * 2, self.dim),
             nn.ReLU(),
-            nn.Dropout(0.3), 
+            nn.Dropout(dropout), 
             nn.Linear(self.dim, 1)
         )
         

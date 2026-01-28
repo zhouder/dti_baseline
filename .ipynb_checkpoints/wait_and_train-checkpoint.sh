@@ -5,9 +5,9 @@
 # =========================
 CHECK_INTERVAL=30          # 每 30 秒检查一次
 THRESHOLD_MB=5120          # 5GB = 5120MB
-REQUIRED_COUNT=4           # 连续 4 次 = 2 分钟
+REQUIRED_COUNT=4          # 连续 4 次 = 2 分钟
 
-CMD="python -m src.train --dataset kiba --mode warm"
+CMD="python -m src.train --dataset davis --mode warm --dropout 0.2"
 
 # =========================
 # 逻辑区

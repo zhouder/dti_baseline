@@ -32,28 +32,6 @@ def seed_everything(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-class EvidentialLoss(nn.Module):
-    def __init__(self, annealing_step=10):
-        super().__init__()
-        self.annealing_step = annealing_step
-
-    def forward(self, alpha, labels, epoch_num):
-        alpha = alpha.clamp(max=50.0)
-        y = F.one_hot(labels.long(), num_classes=2).float().to(alpha.device)
-        S = alpha.sum(dim=1, keepdim=True)
-        p = alpha / S
-        
-        loss_nll = torch.sum(y * (torch.log(S) - torch.log(alpha)), dim=1, keepdim=True).mean()
-        
-        ones = torch.ones_like(alpha)
-        term1 = torch.lgamma(S) - torch.lgamma(alpha).sum(dim=1, keepdim=True) \
-                + torch.lgamma(ones).sum(dim=1, keepdim=True) - torch.lgamma(ones.sum(dim=1, keepdim=True))
-        term2 = ((alpha - ones) * (torch.digamma(alpha) - torch.digamma(S))).sum(dim=1, keepdim=True)
-        kl = term1 + term2
-        
-        lam = min(1.0, epoch_num / self.annealing_step)
-        return loss_nll + lam * kl.mean()
-
 def compute_metrics(y_true, y_probs, threshold=0.5):
     y_pred = (y_probs > threshold).astype(int)
     if len(np.unique(y_true)) < 2:
@@ -73,10 +51,10 @@ def run_epoch(model, loader, criterion, optimizer, device, epoch_idx, is_train=T
     else: model.eval()
     
     total_loss = 0
-    y_true, y_prob = [], []
-    total_uncertainty = 0
-    total_unc_d = 0
-    total_unc_p = 0
+    y_true, y_probs = [], []
+    
+    mean_gate_d = 0
+    mean_gate_p = 0
 
     pbar = tqdm(loader, leave=False, desc="Train" if is_train else "Val", ncols=100)
     for batch in pbar:
@@ -84,34 +62,40 @@ def run_epoch(model, loader, criterion, optimizer, device, epoch_idx, is_train=T
         if is_train: optimizer.zero_grad()
         
         with torch.set_grad_enabled(is_train):
-            # [修改] 不需要传 epoch 了，因为去掉了 bias warmup
-            outputs = model(batch)
-            p, u, alpha, u_d, u_p = outputs[:5]
+            # 传入 epoch 用于 beta warmup
+            logits, g_d, g_p = model(batch, epoch=epoch_idx)
+            labels = batch['label'].float().view(-1, 1)
             
-            labels = batch['label']
-            loss = criterion(alpha, labels, epoch_idx)
+            # 1. Main Loss
+            loss_bce = criterion(logits, labels)
+            
+            # 2. Anti-Collapse Regularization (Small weight)
+            # 鼓励 Gate 具有一定的方差，避免全员躺平
+            if is_train and g_d.shape[0] > 1:
+                reg_loss = -0.001 * (g_d.var() + g_p.var())
+            else:
+                reg_loss = torch.tensor(0.0).to(device)
+            
+            loss = loss_bce + reg_loss
             
             if is_train:
                 loss.backward()
                 optimizer.step()
         
         total_loss += loss.item()
-        probs = p[:, 1]
+        probs = torch.sigmoid(logits)
+        y_true.extend(labels.cpu().numpy().flatten())
+        y_probs.extend(probs.detach().cpu().numpy().flatten())
         
-        y_true.extend(labels.cpu().numpy())
-        y_prob.extend(probs.detach().cpu().numpy())
+        mean_gate_d += g_d.mean().item()
+        mean_gate_p += g_p.mean().item()
         
-        total_uncertainty += u.mean().item()
-        total_unc_d += u_d.mean().item()
-        total_unc_p += u_p.mean().item()
-        
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        pbar.set_postfix(bce=f"{loss_bce.item():.4f}", gate=f"{g_d.mean().item():.2f}")
 
-    metrics = compute_metrics(np.array(y_true), np.array(y_prob))
+    metrics = compute_metrics(np.array(y_true), np.array(y_probs))
     metrics['Loss'] = total_loss / len(loader)
-    metrics['Uncertainty'] = total_uncertainty / len(loader)
-    metrics['Unc_D'] = total_unc_d / len(loader)
-    metrics['Unc_P'] = total_unc_p / len(loader)
+    metrics['Gate_D'] = mean_gate_d / len(loader)
+    metrics['Gate_P'] = mean_gate_p / len(loader)
     return metrics
 
 def align_data_with_hdf5(df, h5_path):
@@ -143,7 +127,6 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
-    parser.add_argument('--annealing_epochs', type=int, default=10)
 
     args = parser.parse_args()
 
@@ -186,7 +169,7 @@ def main():
         model = UGCADTI(dim=args.dim, dropout=args.dropout, num_heads=args.num_heads).to(device)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        criterion = EvidentialLoss(annealing_step=args.annealing_epochs)
+        criterion = nn.BCEWithLogitsLoss()
 
         best_auprc = 0.0
         patience_counter = 0
@@ -206,14 +189,14 @@ def main():
         log_file = os.path.join(fold_dir, 'log.csv')
         if not (args.resume and os.path.exists(log_file)):
             with open(log_file, 'w') as f:
-                f.write("Epoch,TrainLoss,ValLoss,ValUnc,ValUncD,ValUncP,AUPRC,AUROC,F1,ACC,Time\n")
+                f.write("Epoch,TrainLoss,ValLoss,GateD,GateP,AUPRC,AUROC,F1,ACC,Time\n")
 
         prev_lr = optimizer.param_groups[0]['lr']
 
         for epoch in range(start_epoch, args.epochs):
             t0 = time.time()
-            train_met = run_epoch(model, train_loader, criterion, optimizer, device, epoch, True)
-            val_met = run_epoch(model, val_loader, criterion, optimizer, device, epoch, False)
+            train_met = run_epoch(model, train_loader, criterion, optimizer, device, epoch, is_train=True)
+            val_met = run_epoch(model, val_loader, criterion, optimizer, device, epoch, is_train=False)
 
             current_lr = optimizer.param_groups[0]['lr']
             if current_lr != prev_lr:
@@ -238,11 +221,11 @@ def main():
             }, last_ckpt_path)
 
             print(f"Ep {epoch+1:03d} | Loss: {train_met['Loss']:.4f} | AUPRC: {val_met['AUPRC']:.4f} | "
-                  f"Unc: {val_met['Uncertainty']:.4f} (D:{val_met['Unc_D']:.3f} P:{val_met['Unc_P']:.3f}) | Pat: {patience_counter}")
+                  f"Gate(D/P): {val_met['Gate_D']:.3f}/{val_met['Gate_P']:.3f} | Pat: {patience_counter}")
 
             with open(log_file, 'a') as f:
-                f.write(f"{epoch+1},{train_met['Loss']:.5f},{val_met['Loss']:.5f},{val_met['Uncertainty']:.5f},"
-                        f"{val_met['Unc_D']:.5f},{val_met['Unc_P']:.5f},"
+                f.write(f"{epoch+1},{train_met['Loss']:.5f},{val_met['Loss']:.5f},"
+                        f"{val_met['Gate_D']:.5f},{val_met['Gate_P']:.5f},"
                         f"{val_met['AUPRC']:.5f},{val_met['AUROC']:.5f},{val_met['F1']:.5f},{val_met['ACC']:.5f},{dur:.1f}\n")
 
             if patience_counter >= args.patience:
@@ -250,10 +233,10 @@ def main():
 
         if os.path.exists(os.path.join(fold_dir, 'best.pt')):
             model.load_state_dict(torch.load(os.path.join(fold_dir, 'best.pt')))
-            test_met = run_epoch(model, test_loader, criterion, optimizer, device, args.epochs, False)
+            test_met = run_epoch(model, test_loader, criterion, optimizer, device, epoch, is_train=False)
             pd.DataFrame([test_met]).to_csv(result_csv, index=False)
             results.append(test_met)
-            print(f"Fold {fold_id} Result: AUPRC={test_met['AUPRC']:.4f}, Unc={test_met['Uncertainty']:.4f}")
+            print(f"Fold {fold_id} Result: AUPRC={test_met['AUPRC']:.4f}")
 
     if results:
         df_res = pd.DataFrame(results)
@@ -265,7 +248,7 @@ def main():
         print(f"FINAL AGGREGATED RESULTS ({len(results)} Folds)")
         print("="*40)
         for col in mean_res.index:
-            if col not in ['Loss', 'Uncertainty', 'Unc_D', 'Unc_P']:
+            if col not in ['Loss', 'Gate_D', 'Gate_P']:
                 print(f"{col}: {mean_res[col]:.4f} ± {std_res[col]:.4f}")
         print("="*40)
 

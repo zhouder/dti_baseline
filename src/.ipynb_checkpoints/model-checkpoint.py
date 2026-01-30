@@ -3,12 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing, global_mean_pool
 from torch_geometric.utils import to_dense_batch
-import math
 
 class SimpleGVPConv(MessagePassing):
-    """
-    几何向量感知器卷积层 (GVP-style)
-    """
     def __init__(self, s_dim, v_dim):
         super().__init__(aggr='mean')
         self.message_net = nn.Sequential(
@@ -28,10 +24,10 @@ class SimpleGVPConv(MessagePassing):
         return s + aggr_out
 
 class PocketGraphProcessor(nn.Module):
-    def __init__(self, out_dim=256, dropout=0.1, top_k=32):
+    def __init__(self, out_dim=256, dropout=0.1, top_k=16):
         super().__init__()
         self.out_dim = out_dim
-        self.top_k = top_k # [修改] 默认降到 32
+        self.top_k = top_k # [修改] 默认 Top-K = 16 (Short Sequence)
 
         self.s_emb = nn.Linear(23, out_dim)
         self.v_emb = nn.Linear(4, 16)
@@ -68,68 +64,57 @@ class PocketGraphProcessor(nn.Module):
         if not return_tokens:
             return graph_vec
         
-        # [修改] Top-K 筛选逻辑 (保留最重要的节点)
+        # [核心] Top-K 筛选
         tokens, mask = to_dense_batch(node_feat, data.batch) # (B, N_max, D)
         B, N_max, D = tokens.shape
         
         if N_max > self.top_k:
+            # 按特征范数排序，选最重要的节点
             scores = torch.norm(tokens, dim=-1) # (B, N_max)
             scores = scores.masked_fill(~mask, float('-inf'))
             _, topk_indices = torch.topk(scores, k=self.top_k, dim=1) # (B, K)
             
             topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
             tokens = torch.gather(tokens, 1, topk_indices_expanded) # (B, K, D)
-            # Mask 对于 topk 来说全为 True (除非样本节点数本来就少于 K)
-            mask = torch.gather(mask, 1, topk_indices) 
+            mask = torch.gather(mask, 1, topk_indices) # (B, K)
             
         return graph_vec, tokens, mask
 
 class CrossAttnUGCA(nn.Module):
     """
-    [创新点升级] Temperature-Gated Top-M Cross-Attention
-    更稳、更轻量。不使用 logit bias 强抑制，而是用不确定性调节温度。
+    UGCA: Uncertainty-Gated Cross-Attention (Route B)
+    Mechanism: Evidence -> Gate -> Centered Logit Bias
     """
-    def __init__(self, dim, num_heads=4, dropout=0.1, top_m=24, temp_c=1.0):
+    def __init__(self, dim, num_heads=4, dropout=0.1):
         super().__init__()
         assert dim % num_heads == 0
-        self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
         
-        self.top_m = top_m # 参与 Attention 的最大 Token 数
-        self.temp_c = temp_c # 温度调节系数
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         
-        # 投影层 (手动实现 MHA 以便魔改)
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        
-        # Gate Net: 输入 (Query, Key) -> Evidence
-        # 输入维度: 2 * dim (因为是一个个算，也可以加上 diff/prod)
+        # Gate Net
         self.gate_net = nn.Sequential(
             nn.Linear(dim * 4, dim // 4),
             nn.ReLU(),
             nn.Linear(dim // 4, 1),
-            nn.Softplus() 
+            nn.Softplus()
         )
+        
+        # Init bias to open gate initially
+        nn.init.constant_(self.gate_net[-2].bias, 2.0)
 
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, q_vec, kv_tokens, kv_mask):
+    def forward(self, q_vec, kv_tokens, kv_mask, beta=1.0):
         """
-        q_vec: (B, D)
-        kv_tokens: (B, L, D)
-        kv_mask: (B, L)
+        beta: Warmup coefficient for logit bias (0->1)
         """
         B, L, D = kv_tokens.shape
-        Q_global = q_vec.unsqueeze(1) # (B, 1, D)
+        Q = q_vec.unsqueeze(1) # (B, 1, D)
 
-        # --- 1. 计算 Token 级不确定性 ---
-        # 扩展 Query 与每个 KV Token 交互
-        Q_expand = Q_global.expand(-1, L, -1)
+        # --- 1. Compute Uncertainty Gate ---
+        Q_expand = Q.expand(-1, L, -1)
         int_feat = torch.cat([
             Q_expand, kv_tokens, 
             torch.abs(Q_expand - kv_tokens), 
@@ -137,69 +122,45 @@ class CrossAttnUGCA(nn.Module):
         ], dim=-1)
         
         e_tok = self.gate_net(int_feat).squeeze(-1) # (B, L)
-        u_tok = 1.0 / (e_tok + 1.0) # (B, L)
-        g_tok = 1.0 - u_tok         # (B, L) Reliability
+        g_tok = e_tok / (e_tok + 1.0 + 1e-8) # Reliability Gate (0~1)
+        
+        # Soft clamp to avoid log(0)
+        g_tok = g_tok.clamp(0.01, 0.99)
+        
+        # [核心] Centered Logit Bias
+        # log(g) - mean(log(g))
+        # 确保门控只改变 Token 间的相对权重，而不整体压低 logits
+        log_g = torch.log(g_tok)
+        log_g_centered = log_g - log_g.mean(dim=1, keepdim=True)
+        
+        # Apply Beta Warmup
+        attn_bias = beta * log_g_centered # (B, L)
+        
+        # Match MHA shape: (B*H, 1, L)
+        attn_bias = attn_bias.unsqueeze(1).repeat_interleave(self.num_heads, dim=0)
 
-        # --- 2. Top-M 筛选 (降低计算量 + 排除噪声) ---
-        # 确保不选到 Padding
-        g_scores = g_tok.masked_fill(~kv_mask, float('-inf'))
-        
-        # 动态确定实际 K (如果序列本身就很短)
-        actual_k = min(self.top_m, L)
-        
-        # 选出 Top-M 可靠的 Tokens
-        _, topk_idx = torch.topk(g_scores, k=actual_k, dim=1) # (B, M)
-        
-        # Gather KV and Uncertainty
-        # 扩展 idx 用于 gather features
-        topk_idx_feat = topk_idx.unsqueeze(-1).expand(-1, -1, D)
-        
-        K_selected = torch.gather(kv_tokens, 1, topk_idx_feat) # (B, M, D)
-        V_selected = K_selected # K=V
-        u_selected = torch.gather(u_tok, 1, topk_idx) # (B, M)
+        # Handle Padding (Merge into bias)
+        is_padding = ~kv_mask
+        is_padding_expanded = is_padding.unsqueeze(1).repeat_interleave(self.num_heads, dim=0)
+        attn_bias = attn_bias.masked_fill(is_padding_expanded, float('-inf'))
 
-        # --- 3. Temperature-Scaled Cross Attention ---
-        # 投影
-        q = self.q_proj(Q_global).view(B, 1, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, 1, d)
-        k = self.k_proj(K_selected).view(B, actual_k, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, M, d)
-        v = self.v_proj(V_selected).view(B, actual_k, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, M, d)
+        # --- 2. Cross Attention ---
+        ctx, _ = self.attn(Q, kv_tokens, kv_tokens, key_padding_mask=None, attn_mask=attn_bias)
+        ctx = ctx.squeeze(1)
 
-        # Logits (B, H, 1, M)
-        attn_logits = (q @ k.transpose(-2, -1)) * self.scale
+        # --- 3. Fusion ---
+        fused = self.norm(q_vec + self.dropout(ctx))
         
-        # [核心创新] 温度门控
-        # u_selected: (B, M) -> (B, 1, 1, M) 用于广播
-        u_gate = u_selected.unsqueeze(1).unsqueeze(1)
-        
-        # 温度分母: T = 1 + c * u
-        # u 越大 -> T 越大 -> attention 分布越平滑 (High Entropy)
-        # u 越小 -> T 接近 1 -> 正常 sharp attention
-        temp = 1.0 + self.temp_c * u_gate
-        attn_logits = attn_logits / temp
-
-        # Softmax
-        attn_weights = F.softmax(attn_logits, dim=-1)
-        
-        # Aggregation
-        out = (attn_weights @ v).transpose(1, 2).reshape(B, 1, D)
-        out = self.out_proj(out).squeeze(1)
-
-        # --- 4. 融合 ---
-        fused = self.norm(q_vec + self.dropout(out))
-        
-        # 统计平均不确定性 (用于监控)
-        u_avg = u_selected.mean(dim=1)
-        
-        return fused, u_avg.unsqueeze(1), e_tok, attn_weights
+        return fused, g_tok
 
 class UGCADTI(nn.Module):
     def __init__(self, dim=256, dropout=0.1, num_heads=4):
         super().__init__()
         self.dim = dim
-        molclr_dim = 300
+        self.warmup_epochs = 10 
         
         self.molclr_proj = nn.Sequential(
-            nn.Linear(molclr_dim, self.dim),
+            nn.Linear(300, self.dim),
             nn.LayerNorm(self.dim), nn.ReLU(), nn.Dropout(dropout)
         )
         self.chemberta_proj = nn.Sequential(
@@ -208,63 +169,58 @@ class UGCADTI(nn.Module):
         )
         self.esm2_proj = nn.Sequential(
             nn.Linear(1280, self.dim),
-            nn.LayerNorm(self.dim), nn.ReLU(), nn.Dropout(dropout))
+            nn.LayerNorm(self.dim), nn.ReLU(), nn.Dropout(dropout)
+        )
         
-        # [修改] Pocket Top-K = 32
-        self.pocket_proc = PocketGraphProcessor(out_dim=self.dim, dropout=dropout, top_k=32)
+        # [修改] Top-K = 16 (Small K for stability)
+        self.pocket_proc = PocketGraphProcessor(out_dim=self.dim, dropout=dropout, top_k=16)
 
-        # [修改] UGCA (Top-M = 24, Temp-C = 1.0)
-        self.ugca_drug = CrossAttnUGCA(dim, num_heads=num_heads, dropout=dropout, top_m=24, temp_c=1.0)
-        self.ugca_prot = CrossAttnUGCA(dim, num_heads=num_heads, dropout=dropout, top_m=24, temp_c=1.0)
+        self.ugca_drug = CrossAttnUGCA(dim, num_heads=num_heads, dropout=dropout)
+        self.ugca_prot = CrossAttnUGCA(dim, num_heads=num_heads, dropout=dropout)
 
-        # 普通 Evidential Head (拼接)
-        self.fusion_evidence = nn.Sequential(
+        # Simple Classifier
+        self.classifier = nn.Sequential(
             nn.Linear(self.dim * 2, self.dim),
-            nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(self.dim, 2), nn.Softplus()
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.dim, 1)
         )
 
+    def get_beta(self, epoch):
+        if epoch is None or epoch < 0: return 1.0
+        return min(1.0, epoch / self.warmup_epochs)
+
     def forward(self, batch, epoch=None):
-        # --- Drug Tokens (B, 2, D) ---
-        # [修改] 不再切分，直接用 MolCLR 和 ChemBERTa 各 1 个
+        beta = self.get_beta(epoch)
+
+        # --- 1. Drug Inputs ---
         d1 = self.molclr_proj(batch['molclr']) 
         d2 = self.chemberta_proj(batch['chemberta'])
+        h_d = d1 + d2 # Query
         
-        # Query: Sum
-        h_d = d1 + d2
-        
-        # KV: 2 Tokens
-        drug_tokens = torch.stack([d1, d2], dim=1) 
-        drug_mask = torch.ones(drug_tokens.size(0), 2, dtype=torch.bool, device=drug_tokens.device)
+        # Drug KV: [d1, d2] (Length=2)
+        drug_kv = torch.stack([d1, d2], dim=1)
+        drug_mask = torch.ones(d1.size(0), 2, dtype=torch.bool, device=d1.device)
 
-        # --- Protein Tokens (B, 2+K, D) ---
+        # --- 2. Protein Inputs ---
         p1 = self.esm2_proj(batch['esm2']) 
-        # Pocket Global + Tokens
-        pocket_vec, pocket_tokens, pocket_mask = self.pocket_proc(batch['graph'], return_tokens=True)
+        # Get global vec AND top-k nodes
+        pocket_vec, pocket_nodes, pocket_mask = self.pocket_proc(batch['graph'], return_tokens=True)
+        h_p = p1 + pocket_vec # Query
+
+        # Protein KV: [p1, pocket_vec, pocket_nodes] (Length=2+K)
+        # p1 and pocket_vec are global tokens (mask=True)
+        global_mask = torch.ones(p1.size(0), 2, dtype=torch.bool, device=p1.device)
         
-        # Query: ESM2 + Pocket Global
-        h_p = p1 + pocket_vec 
+        prot_kv = torch.cat([p1.unsqueeze(1), pocket_vec.unsqueeze(1), pocket_nodes], dim=1)
+        prot_mask = torch.cat([global_mask, pocket_mask], dim=1)
 
-        # KV: [ESM2, Pocket_Global, Pocket_Nodes...]
-        p_tokens = torch.cat([p1.unsqueeze(1), pocket_vec.unsqueeze(1), pocket_tokens], dim=1)
-        p_mask = torch.cat([
-            torch.ones(p1.size(0), 2, dtype=torch.bool, device=p1.device), # 2 global tokens
-            pocket_mask
-        ], dim=1)
+        # --- 3. UGCA Interaction ---
+        z_d, g_d = self.ugca_drug(q_vec=h_d, kv_tokens=prot_kv, kv_mask=prot_mask, beta=beta)
+        z_p, g_p = self.ugca_prot(q_vec=h_p, kv_tokens=drug_kv, kv_mask=drug_mask, beta=beta)
 
-        # --- UGCA Interaction (Temp Gate + Top-M) ---
-        # 此时无需 epoch warmup，因为 Temp 机制比较温和
-        z_d, u_d, e_d, attn_dp = self.ugca_drug(h_d, p_tokens, p_mask)
-        z_p, u_p, e_p, attn_pd = self.ugca_prot(h_p, drug_tokens, drug_mask)
-
-        # --- 朴素拼接 ---
+        # --- 4. Prediction ---
         z = torch.cat([z_d, z_p], dim=-1)
-        
-        # --- Prediction ---
-        e = self.fusion_evidence(z)
-        alpha = e + 1.0
-        S = alpha.sum(dim=-1, keepdim=True)
-        p = alpha / S
-        u = 2.0 / S
+        logits = self.classifier(z)
 
-        return p, u, alpha, u_d, u_p, attn_dp, attn_pd
+        return logits, g_d, g_p
